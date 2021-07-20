@@ -47,7 +47,7 @@ import {
     PREFIX_UNSTABLE,
     retryNetworkOperation,
 } from "./http-api";
-import { Crypto, fixBackupKey, IBootstrapCrossSigningOpts, isCryptoAvailable } from './crypto';
+import { Crypto, fixBackupKey, IBootstrapCrossSigningOpts, IMegolmSessionData, isCryptoAvailable } from './crypto';
 import { DeviceInfo, IDevice } from "./crypto/deviceinfo";
 import { decodeRecoveryKey } from './crypto/recoverykey';
 import { keyFromAuthData } from './crypto/key_passphrase';
@@ -59,12 +59,13 @@ import {
     IKeyBackupPrepareOpts,
     IKeyBackupRestoreOpts,
     IKeyBackupRestoreResult,
-    IKeyBackupVersion,
+    IKeyBackupInfo,
 } from "./crypto/keybackup";
 import { IIdentityServerProvider } from "./@types/IIdentityServerProvider";
 import type Request from "request";
 import { MatrixScheduler } from "./scheduler";
-import { ICryptoCallbacks, ISecretStorageKeyInfo, NotificationCountType } from "./matrix";
+import { ICryptoCallbacks, NotificationCountType } from "./matrix";
+import { ISecretStorageKeyInfo } from "./crypto/api";
 import { MemoryCryptoStore } from "./crypto/store/memory-crypto-store";
 import { LocalStorageCryptoStore } from "./crypto/store/localStorage-crypto-store";
 import { IndexedDBCryptoStore } from "./crypto/store/indexeddb-crypto-store";
@@ -83,7 +84,6 @@ import {
     IEncryptedEventInfo,
     IImportRoomKeysOpts,
     IRecoveryKey,
-    ISecretStorageKey,
 } from "./crypto/api";
 import { CrossSigningInfo, DeviceTrustLevel, UserTrustLevel } from "./crypto/CrossSigning";
 import { Room } from "./models/room";
@@ -114,8 +114,9 @@ import url from "url";
 import { randomString } from "./randomstring";
 import { ReadStream } from "fs";
 import { WebStorageSessionStore } from "./store/session/webstorage";
-import { BackupManager, IKeyBackupCheck, TrustInfo } from "./crypto/backup";
+import { BackupManager, IKeyBackupCheck, IPreparedKeyBackupVersion, TrustInfo } from "./crypto/backup";
 import { DEFAULT_TREE_POWER_LEVELS_TEMPLATE, MSC3089TreeSpace } from "./models/MSC3089TreeSpace";
+import { ISignatures } from "./@types/signed";
 
 export type Store = StubStore | MemoryStore | LocalIndexedDBStoreBackend | RemoteIndexedDBStoreBackend;
 export type SessionStore = WebStorageSessionStore;
@@ -297,6 +298,11 @@ export interface IMatrixClientCreateOpts extends ICreateClientOpts {
     usingExternalCrypto?: boolean;
 }
 
+export enum PendingEventOrdering {
+    Chronological = "chronological",
+    Detached = "detached",
+}
+
 export interface IStartClientOpts {
     /**
      * The event <code>limit=</code> to apply to initial sync. Default: 8.
@@ -319,7 +325,7 @@ export interface IStartClientOpts {
      * pending messages will appear in a separate list, accessbile via {@link module:models/room#getPendingEvents}.
      * Default: "chronological".
      */
-    pendingEventOrdering?: "chronological" | "detached";
+    pendingEventOrdering?: PendingEventOrdering;
 
     /**
      * The number of milliseconds to wait on /sync. Default: 30000 (30 seconds).
@@ -375,6 +381,52 @@ interface ICapabilities {
     "m.room_versions"?: IRoomVersionsCapability;
 }
 
+/* eslint-disable camelcase */
+export interface ICrossSigningKey {
+    keys: { [algorithm: string]: string };
+    signatures?: ISignatures;
+    usage: string[];
+    user_id: string;
+}
+
+enum CrossSigningKeyType {
+    MasterKey = "master_key",
+    SelfSigningKey = "self_signing_key",
+    UserSigningKey = "user_signing_key",
+}
+
+export type CrossSigningKeys = Record<CrossSigningKeyType, ICrossSigningKey>;
+
+export interface ISignedKey {
+    keys: Record<string, string>;
+    signatures: ISignatures;
+    user_id: string;
+    algorithms: string[];
+    device_id: string;
+}
+/* eslint-enable camelcase */
+
+export type KeySignatures = Record<string, Record<string, ICrossSigningKey | ISignedKey>>;
+interface IUploadKeySignaturesResponse {
+    failures: Record<string, Record<string, {
+        errcode: string;
+        error: string;
+    }>>;
+}
+
+export interface IPreviewUrlResponse {
+    [key: string]: string | number;
+    "og:title": string;
+    "og:type": string;
+    "og:url": string;
+    "og:image"?: string;
+    "og:image:type"?: string;
+    "og:image:height"?: number;
+    "og:image:width"?: number;
+    "og:description"?: string;
+    "matrix:image:size"?: number;
+}
+
 /**
  * Represents a Matrix Client. Only directly construct this if you want to use
  * custom modules. Normally, {@link createClient} should be used
@@ -420,7 +472,7 @@ export class MatrixClient extends EventEmitter {
     protected fallbackICEServerAllowed = false;
     protected roomList: RoomList;
     protected syncApi: SyncApi;
-    protected pushRules: any; // TODO: Types
+    public pushRules: any; // TODO: Types
     protected syncLeftRoomsPromise: Promise<Room[]>;
     protected syncedLeftRooms = false;
     protected clientOpts: IStoredClientOpts;
@@ -1802,7 +1854,11 @@ export class MatrixClient extends EventEmitter {
      *     keyId: {string} the ID of the key
      *     keyInfo: {object} details about the key (iv, mac, passphrase)
      */
-    public addSecretStorageKey(algorithm: string, opts: IAddSecretStorageKeyOpts, keyName?: string): ISecretStorageKey {
+    public addSecretStorageKey(
+        algorithm: string,
+        opts: IAddSecretStorageKeyOpts,
+        keyName?: string,
+    ): Promise<{keyId: string, keyInfo: ISecretStorageKeyInfo}> {
         if (!this.crypto) {
             throw new Error("End-to-end encryption disabled");
         }
@@ -1818,7 +1874,7 @@ export class MatrixClient extends EventEmitter {
      *     for. Defaults to the default key ID if not provided.
      * @return {boolean} Whether we have the key.
      */
-    public hasSecretStorageKey(keyId?: string): boolean {
+    public hasSecretStorageKey(keyId?: string): Promise<boolean> {
         if (!this.crypto) {
             throw new Error("End-to-end encryption disabled");
         }
@@ -1871,7 +1927,7 @@ export class MatrixClient extends EventEmitter {
      *     with, or null if it is not present or not encrypted with a trusted
      *     key
      */
-    public isSecretStored(name: string, checkKey: boolean): Record<string, ISecretStorageKeyInfo> {
+    public isSecretStored(name: string, checkKey: boolean): Promise<Record<string, ISecretStorageKeyInfo>> {
         if (!this.crypto) {
             throw new Error("End-to-end encryption disabled");
         }
@@ -2062,7 +2118,7 @@ export class MatrixClient extends EventEmitter {
      * @return {Promise} a promise which resolves when the keys
      *    have been imported
      */
-    public importRoomKeys(keys: any[], opts: IImportRoomKeysOpts): Promise<void> {
+    public importRoomKeys(keys: IMegolmSessionData[], opts: IImportRoomKeysOpts): Promise<void> {
         if (!this.crypto) {
             throw new Error("End-to-end encryption disabled");
         }
@@ -2086,28 +2142,26 @@ export class MatrixClient extends EventEmitter {
      * Get information about the current key backup.
      * @returns {Promise} Information object from API or null
      */
-    public getKeyBackupVersion(): Promise<IKeyBackupVersion> {
-        return this.http.authedRequest(
-            undefined, "GET", "/room_keys/version", undefined, undefined,
-            { prefix: PREFIX_UNSTABLE },
-        ).then((res) => {
-            if (res.algorithm !== olmlib.MEGOLM_BACKUP_ALGORITHM) {
-                const err = "Unknown backup algorithm: " + res.algorithm;
-                return Promise.reject(err);
-            } else if (!(typeof res.auth_data === "object")
-                || !res.auth_data.public_key) {
-                const err = "Invalid backup data returned";
-                return Promise.reject(err);
-            } else {
-                return res;
-            }
-        }).catch((e) => {
+    public async getKeyBackupVersion(): Promise<IKeyBackupInfo> {
+        let res;
+        try {
+            res = await this.http.authedRequest(
+                undefined, "GET", "/room_keys/version", undefined, undefined,
+                { prefix: PREFIX_UNSTABLE },
+            );
+        } catch (e) {
             if (e.errcode === 'M_NOT_FOUND') {
                 return null;
             } else {
                 throw e;
             }
-        });
+        }
+        try {
+            BackupManager.checkBackupVersion(res);
+        } catch (e) {
+            throw e;
+        }
+        return res;
     }
 
     /**
@@ -2120,7 +2174,7 @@ export class MatrixClient extends EventEmitter {
      *     ]
      * }
      */
-    public isKeyBackupTrusted(info: IKeyBackupVersion): Promise<TrustInfo> {
+    public isKeyBackupTrusted(info: IKeyBackupInfo): Promise<TrustInfo> {
         return this.crypto.backupManager.isKeyBackupTrusted(info);
     }
 
@@ -2143,7 +2197,7 @@ export class MatrixClient extends EventEmitter {
      * @param {object} info Backup information object as returned by getKeyBackupVersion
      * @returns {Promise<void>} Resolves when complete.
      */
-    public enableKeyBackup(info: IKeyBackupVersion): Promise<void> {
+    public enableKeyBackup(info: IKeyBackupInfo): Promise<void> {
         if (!this.crypto) {
             throw new Error("End-to-end encryption disabled");
         }
@@ -2180,7 +2234,7 @@ export class MatrixClient extends EventEmitter {
     public async prepareKeyBackupVersion(
         password: string,
         opts: IKeyBackupPrepareOpts = { secureSecretStorage: false },
-    ): Promise<IKeyBackupVersion> {
+    ): Promise<Pick<IPreparedKeyBackupVersion, "algorithm" | "auth_data" | "recovery_key">> {
         if (!this.crypto) {
             throw new Error("End-to-end encryption disabled");
         }
@@ -2198,7 +2252,7 @@ export class MatrixClient extends EventEmitter {
             algorithm,
             auth_data,
             recovery_key,
-        } as any; // TODO: Types
+        };
     }
 
     /**
@@ -2219,7 +2273,7 @@ export class MatrixClient extends EventEmitter {
      * @returns {Promise<object>} Object with 'version' param indicating the version created
      */
     // TODO: Fix types
-    public async createKeyBackupVersion(info: IKeyBackupVersion): Promise<IKeyBackupVersion> {
+    public async createKeyBackupVersion(info: IKeyBackupInfo): Promise<IKeyBackupInfo> {
         if (!this.crypto) {
             throw new Error("End-to-end encryption disabled");
         }
@@ -2313,7 +2367,7 @@ export class MatrixClient extends EventEmitter {
      * Back up session keys to the homeserver.
      * @param {string} roomId ID of the room that the keys are for Optional.
      * @param {string} sessionId ID of the session that the keys are for Optional.
-     * @param {integer} version backup version Optional.
+     * @param {number} version backup version Optional.
      * @param {object} data Object keys to send
      * @return {Promise} a promise that will resolve when the keys
      * are uploaded
@@ -2375,7 +2429,7 @@ export class MatrixClient extends EventEmitter {
      * @param {object} backupInfo Backup metadata from `checkKeyBackup`
      * @return {Promise<Uint8Array>} key backup key
      */
-    public keyBackupKeyFromPassword(password: string, backupInfo: IKeyBackupVersion): Promise<Uint8Array> {
+    public keyBackupKeyFromPassword(password: string, backupInfo: IKeyBackupInfo): Promise<Uint8Array> {
         return keyFromAuthData(backupInfo.auth_data, password);
     }
 
@@ -2410,7 +2464,7 @@ export class MatrixClient extends EventEmitter {
         password: string,
         targetRoomId: string,
         targetSessionId: string,
-        backupInfo: IKeyBackupVersion,
+        backupInfo: IKeyBackupInfo,
         opts: IKeyBackupRestoreOpts,
     ): Promise<IKeyBackupRestoreResult> {
         const privKey = await keyFromAuthData(backupInfo.auth_data, password);
@@ -2434,7 +2488,7 @@ export class MatrixClient extends EventEmitter {
      */
     // TODO: Types
     public async restoreKeyBackupWithSecretStorage(
-        backupInfo: IKeyBackupVersion,
+        backupInfo: IKeyBackupInfo,
         targetRoomId?: string,
         targetSessionId?: string,
         opts?: IKeyBackupRestoreOpts,
@@ -2474,20 +2528,18 @@ export class MatrixClient extends EventEmitter {
         recoveryKey: string,
         targetRoomId: string,
         targetSessionId: string,
-        backupInfo: IKeyBackupVersion,
+        backupInfo: IKeyBackupInfo,
         opts: IKeyBackupRestoreOpts,
     ): Promise<IKeyBackupRestoreResult> {
         const privKey = decodeRecoveryKey(recoveryKey);
-        return this.restoreKeyBackup(
-            privKey, targetRoomId, targetSessionId, backupInfo, opts,
-        );
+        return this.restoreKeyBackup(privKey, targetRoomId, targetSessionId, backupInfo, opts);
     }
 
     // TODO: Types
     public async restoreKeyBackupWithCache(
         targetRoomId: string,
         targetSessionId: string,
-        backupInfo: IKeyBackupVersion,
+        backupInfo: IKeyBackupInfo,
         opts?: IKeyBackupRestoreOpts,
     ): Promise<IKeyBackupRestoreResult> {
         const privKey = await this.crypto.getSessionBackupPrivateKey();
@@ -2498,10 +2550,10 @@ export class MatrixClient extends EventEmitter {
     }
 
     private async restoreKeyBackup(
-        privKey: Uint8Array,
+        privKey: ArrayLike<number>,
         targetRoomId: string,
         targetSessionId: string,
-        backupInfo: IKeyBackupVersion,
+        backupInfo: IKeyBackupInfo,
         opts?: IKeyBackupRestoreOpts,
     ): Promise<IKeyBackupRestoreResult> {
         const cacheCompleteCallback = opts?.cacheCompleteCallback;
@@ -2519,6 +2571,8 @@ export class MatrixClient extends EventEmitter {
         );
 
         const algorithm = await BackupManager.makeAlgorithm(backupInfo, async () => { return privKey; });
+
+        const untrusted = algorithm.untrusted;
 
         try {
             // If the pubkey computed from the private data we've been given
@@ -2587,7 +2641,7 @@ export class MatrixClient extends EventEmitter {
 
         await this.importRoomKeys(keys, {
             progressCallback,
-            untrusted: true,
+            untrusted,
             source: "backup",
         });
 
@@ -3658,10 +3712,14 @@ export class MatrixClient extends EventEmitter {
      * @return {module:http-api.MatrixError} Rejects: with an error response.
      * May return synthesized attributes if the URL lacked OG meta.
      */
-    public getUrlPreview(url: string, ts: number, callback?: Callback): Promise<any> {
+    public getUrlPreview(url: string, ts: number, callback?: Callback): Promise<IPreviewUrlResponse> {
         // bucket the timestamp to the nearest minute to prevent excessive spam to the server
         // Surely 60-second accuracy is enough for anyone.
         ts = Math.floor(ts / 60000) * 60000;
+
+        const parsed = new URL(url);
+        parsed.hash = ""; // strip the hash as it won't affect the preview
+        url = parsed.toString();
 
         const key = ts + "_" + url;
 
@@ -4470,7 +4528,7 @@ export class MatrixClient extends EventEmitter {
             return Promise.resolve(false);
         }
 
-        const pendingRequest = eventTimeline._paginationRequests[dir];
+        const pendingRequest = eventTimeline.paginationRequests[dir];
 
         if (pendingRequest) {
             // already a request in progress - return the existing promise
@@ -4519,9 +4577,9 @@ export class MatrixClient extends EventEmitter {
                 }
                 return res.next_token ? true : false;
             }).finally(() => {
-                eventTimeline._paginationRequests[dir] = null;
+                eventTimeline.paginationRequests[dir] = null;
             });
-            eventTimeline._paginationRequests[dir] = promise;
+            eventTimeline.paginationRequests[dir] = promise;
         } else {
             const room = this.getRoom(eventTimeline.getRoomId());
             if (!room) {
@@ -4553,9 +4611,9 @@ export class MatrixClient extends EventEmitter {
                 }
                 return res.end != res.start;
             }).finally(() => {
-                eventTimeline._paginationRequests[dir] = null;
+                eventTimeline.paginationRequests[dir] = null;
             });
-            eventTimeline._paginationRequests[dir] = promise;
+            eventTimeline.paginationRequests[dir] = promise;
         }
 
         return promise;
@@ -7092,7 +7150,7 @@ export class MatrixClient extends EventEmitter {
         return this.http.authedRequest(callback, "POST", "/keys/upload", undefined, content);
     }
 
-    public uploadKeySignatures(content: any): Promise<any> { // TODO: Types
+    public uploadKeySignatures(content: KeySignatures): Promise<IUploadKeySignaturesResponse> {
         return this.http.authedRequest(
             undefined, "POST", '/keys/signatures/upload', undefined,
             content, {
@@ -7191,7 +7249,7 @@ export class MatrixClient extends EventEmitter {
         return this.http.authedRequest(undefined, "GET", path, qps, undefined);
     }
 
-    public uploadDeviceSigningKeys(auth: any, keys: any): Promise<any> { // TODO: Lots of types
+    public uploadDeviceSigningKeys(auth: any, keys: CrossSigningKeys): Promise<{}> { // TODO: types
         const data = Object.assign({}, keys);
         if (auth) Object.assign(data, { auth });
         return this.http.authedRequest(
@@ -7603,7 +7661,11 @@ export class MatrixClient extends EventEmitter {
      *    supplied.
      * @return {Promise} Resolves to the result object
      */
-    public sendToDevice(eventType: string, contentMap: any, txnId?: string): Promise<any> { // TODO: Types
+    public sendToDevice(
+        eventType: string,
+        contentMap: { [userId: string]: { [deviceId: string]: Record<string, any> } },
+        txnId?: string,
+    ): Promise<{}> {
         const path = utils.encodeUri("/sendToDevice/$eventType/$txnId", {
             $eventType: eventType,
             $txnId: txnId ? txnId : this.makeTxnId(),

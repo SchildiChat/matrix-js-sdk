@@ -74,7 +74,7 @@ export interface IContent {
 
 type StrippedState = Required<Pick<IEvent, "content" | "state_key" | "type" | "sender">>;
 
-interface IUnsigned {
+export interface IUnsigned {
     age?: number;
     prev_sender?: string;
     prev_content?: IContent;
@@ -112,7 +112,7 @@ interface IAggregatedRelation {
 }
 
 interface IEventRelation {
-    rel_type: string;
+    rel_type: RelationType | string;
     event_id: string;
     key?: string;
 }
@@ -120,9 +120,9 @@ interface IEventRelation {
 interface IDecryptionResult {
     clearEvent: {
         room_id?: string;
-        type: string,
-        content: IContent,
-        unsigned?: IUnsigned,
+        type: string;
+        content: IContent;
+        unsigned?: IUnsigned;
     };
     forwardingCurve25519KeyChain?: string[];
     senderCurve25519Key?: string;
@@ -131,7 +131,7 @@ interface IDecryptionResult {
 }
 /* eslint-enable camelcase */
 
-interface IClearEvent {
+export interface IClearEvent {
     type: string;
     content: Omit<IContent, "membership" | "avatar_url" | "displayname" | "m.relates_to">;
     unsigned?: IUnsigned;
