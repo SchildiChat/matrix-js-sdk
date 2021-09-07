@@ -1277,7 +1277,7 @@ export class MatrixCall extends EventEmitter {
         // https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API/Perfect_negotiation
         const offerCollision = (
             (description.type === 'offer') &&
-            (this.makingOffer || this.peerConn.signalingState != 'stable')
+            (this.makingOffer || this.peerConn.signalingState !== 'stable')
         );
 
         this.ignoreOffer = !polite && offerCollision;
@@ -1925,6 +1925,10 @@ export class MatrixCall extends EventEmitter {
                 }
             }
         }
+    }
+
+    public get hasPeerConnection() {
+        return Boolean(this.peerConn);
     }
 }
 

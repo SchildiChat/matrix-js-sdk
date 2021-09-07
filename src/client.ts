@@ -30,7 +30,7 @@ import * as utils from './utils';
 import { sleep } from './utils';
 import { Group } from "./models/group";
 import { Direction, EventTimeline } from "./models/event-timeline";
-import { PushAction, PushProcessor } from "./pushprocessor";
+import { IActionsObject, PushProcessor } from "./pushprocessor";
 import { AutoDiscovery } from "./autodiscovery";
 import * as olmlib from "./crypto/olmlib";
 import { decodeBase64, encodeBase64 } from "./crypto/olmlib";
@@ -140,7 +140,7 @@ import {
     SearchOrderBy,
 } from "./@types/search";
 import { ISynapseAdminDeactivateResponse, ISynapseAdminWhoisResponse } from "./@types/synapse";
-import { ISpaceSummaryEvent, ISpaceSummaryRoom } from "./@types/spaces";
+import { IHierarchyRoom, ISpaceSummaryEvent, ISpaceSummaryRoom } from "./@types/spaces";
 import { IPusher, IPusherRequest, IPushRules, PushRuleAction, PushRuleKind, RuleId } from "./@types/PushRules";
 import { IThreepid } from "./@types/threepids";
 import { CryptoStore } from "./crypto/store/base";
@@ -521,7 +521,7 @@ interface IMessagesResponse {
     state: IStateEvent[];
 }
 
-interface IRequestTokenResponse {
+export interface IRequestTokenResponse {
     sid: string;
     submit_url?: string;
 }
@@ -600,7 +600,7 @@ interface IUserDirectoryResponse {
     limited: boolean;
 }
 
-interface IMyDevice {
+export interface IMyDevice {
     device_id: string;
     display_name?: string;
     last_seen_ip?: string;
@@ -2931,6 +2931,7 @@ export class MatrixClient extends EventEmitter {
      * has been emitted.
      * @param {string} groupId The group ID
      * @return {Group} The Group or null if the group is not known or there is no data store.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public getGroup(groupId: string): Group {
         return this.store.getGroup(groupId);
@@ -2939,6 +2940,7 @@ export class MatrixClient extends EventEmitter {
     /**
      * Retrieve all known groups.
      * @return {Group[]} A list of groups, or an empty list if there is no data store.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public getGroups(): Group[] {
         return this.store.getGroups();
@@ -4340,7 +4342,7 @@ export class MatrixClient extends EventEmitter {
      * @param {MatrixEvent} event The event to get push actions for.
      * @return {module:pushprocessor~PushAction} A dict of actions to perform.
      */
-    public getPushActionsForEvent(event: MatrixEvent): PushAction {
+    public getPushActionsForEvent(event: MatrixEvent): IActionsObject {
         if (!event.getPushActions()) {
             event.setPushActions(this.pushProcessor.actionsForEvent(event));
         }
@@ -5076,7 +5078,7 @@ export class MatrixClient extends EventEmitter {
         email: string,
         clientSecret: string,
         sendAttempt: number,
-        nextLink: string,
+        nextLink?: string,
     ): Promise<IRequestTokenResponse> {
         return this.requestTokenFromEndpoint(
             "/account/password/email/requestToken",
@@ -7973,14 +7975,15 @@ export class MatrixClient extends EventEmitter {
     }
 
     /**
-     * Fetches or paginates a summary of a space as defined by MSC2946
+     * Fetches or paginates a summary of a space as defined by an initial version of MSC2946
      * @param {string} roomId The ID of the space-room to use as the root of the summary.
      * @param {number?} maxRoomsPerSpace The maximum number of rooms to return per subspace.
      * @param {boolean?} suggestedOnly Whether to only return rooms with suggested=true.
      * @param {boolean?} autoJoinOnly Whether to only return rooms with auto_join=true.
      * @param {number?} limit The maximum number of rooms to return in total.
      * @param {string?} batch The opaque token to paginate a previous summary request.
-     * @returns {Promise} the response, with next_batch, rooms, events fields.
+     * @returns {Promise} the response, with next_token, rooms fields.
+     * @deprecated in favour of `getRoomHierarchy` due to the MSC changing paths.
      */
     public getSpaceSummary(
         roomId: string,
@@ -7989,10 +7992,7 @@ export class MatrixClient extends EventEmitter {
         autoJoinOnly?: boolean,
         limit?: number,
         batch?: string,
-    ): Promise<{
-        rooms: ISpaceSummaryRoom[];
-        events: ISpaceSummaryEvent[];
-    }> {
+    ): Promise<{rooms: ISpaceSummaryRoom[], events: ISpaceSummaryEvent[]}> {
         const path = utils.encodeUri("/rooms/$roomId/spaces", {
             $roomId: roomId,
         });
@@ -8005,6 +8005,60 @@ export class MatrixClient extends EventEmitter {
             batch,
         }, {
             prefix: "/_matrix/client/unstable/org.matrix.msc2946",
+        });
+    }
+
+    /**
+     * Fetches or paginates a room hierarchy as defined by MSC2946.
+     * Falls back gracefully to sourcing its data from `getSpaceSummary` if this API is not yet supported by the server.
+     * @param {string} roomId The ID of the space-room to use as the root of the summary.
+     * @param {number?} limit The maximum number of rooms to return per page.
+     * @param {number?} maxDepth The maximum depth in the tree from the root room to return.
+     * @param {boolean?} suggestedOnly Whether to only return rooms with suggested=true.
+     * @param {string?} fromToken The opaque token to paginate a previous request.
+     * @returns {Promise} the response, with next_batch & rooms fields.
+     */
+    public getRoomHierarchy(
+        roomId: string,
+        limit?: number,
+        maxDepth?: number,
+        suggestedOnly = false,
+        fromToken?: string,
+    ): Promise<{
+        rooms: IHierarchyRoom[];
+        next_batch?: string; // eslint-disable-line camelcase
+    }> {
+        const path = utils.encodeUri("/rooms/$roomId/hierarchy", {
+            $roomId: roomId,
+        });
+
+        return this.http.authedRequest(undefined, "GET", path, {
+            suggested_only: suggestedOnly,
+            max_depth: maxDepth,
+            from: fromToken,
+            limit,
+        }, undefined, {
+            prefix: "/_matrix/client/unstable/org.matrix.msc2946",
+        }).catch(e => {
+            if (e.errcode === "M_UNRECOGNIZED") {
+                // fall back to the older space summary API as it exposes the same data just in a different shape.
+                return this.getSpaceSummary(roomId, undefined, suggestedOnly, undefined, limit)
+                    .then(({ rooms, events }) => {
+                        // Translate response from `/spaces` to that we expect in this API.
+                        const roomMap = new Map(rooms.map(r => {
+                            return [r.room_id, <IHierarchyRoom>{ ...r, children_state: [] }];
+                        }));
+                        events.forEach(e => {
+                            roomMap.get(e.room_id)?.children_state.push(e);
+                        });
+
+                        return {
+                            rooms: Array.from(roomMap.values()),
+                        };
+                    });
+            }
+
+            throw e;
         });
     }
 
@@ -8060,7 +8114,7 @@ export class MatrixClient extends EventEmitter {
      */
     public unstableGetFileTreeSpace(roomId: string): MSC3089TreeSpace {
         const room = this.getRoom(roomId);
-        if (!room) return null;
+        if (room?.getMyMembership() !== 'join') return null;
 
         const createEvent = room.currentState.getStateEvents(EventType.RoomCreate, "");
         const purposeEvent = room.currentState.getStateEvents(
@@ -8085,6 +8139,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string} groupId
      * @return {Promise} Resolves: Group summary object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public getGroupSummary(groupId: string): Promise<any> {
         const path = utils.encodeUri("/groups/$groupId/summary", { $groupId: groupId });
@@ -8095,6 +8150,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string} groupId
      * @return {Promise} Resolves: Group profile object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public getGroupProfile(groupId: string): Promise<any> {
         const path = utils.encodeUri("/groups/$groupId/profile", { $groupId: groupId });
@@ -8110,6 +8166,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string=} profile.long_description A longer HTML description of the room
      * @return {Promise} Resolves: Empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public setGroupProfile(groupId: string, profile: any): Promise<any> {
         const path = utils.encodeUri("/groups/$groupId/profile", { $groupId: groupId });
@@ -8126,6 +8183,7 @@ export class MatrixClient extends EventEmitter {
      *     required to join.
      * @return {Promise} Resolves: Empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public setGroupJoinPolicy(groupId: string, policy: any): Promise<any> {
         const path = utils.encodeUri(
@@ -8143,6 +8201,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string} groupId
      * @return {Promise} Resolves: Group users list object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public getGroupUsers(groupId: string): Promise<any> {
         const path = utils.encodeUri("/groups/$groupId/users", { $groupId: groupId });
@@ -8153,6 +8212,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string} groupId
      * @return {Promise} Resolves: Group users list object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public getGroupInvitedUsers(groupId: string): Promise<any> {
         const path = utils.encodeUri("/groups/$groupId/invited_users", { $groupId: groupId });
@@ -8163,6 +8223,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string} groupId
      * @return {Promise} Resolves: Group rooms list object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public getGroupRooms(groupId: string): Promise<any> {
         const path = utils.encodeUri("/groups/$groupId/rooms", { $groupId: groupId });
@@ -8174,6 +8235,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string} userId
      * @return {Promise} Resolves: Empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public inviteUserToGroup(groupId: string, userId: string): Promise<any> {
         const path = utils.encodeUri(
@@ -8188,6 +8250,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string} userId
      * @return {Promise} Resolves: Empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public removeUserFromGroup(groupId: string, userId: string): Promise<any> {
         const path = utils.encodeUri(
@@ -8203,6 +8266,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string} roleId Optional.
      * @return {Promise} Resolves: Empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public addUserToGroupSummary(groupId: string, userId: string, roleId: string): Promise<any> {
         const path = utils.encodeUri(
@@ -8219,6 +8283,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string} userId
      * @return {Promise} Resolves: Empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public removeUserFromGroupSummary(groupId: string, userId: string): Promise<any> {
         const path = utils.encodeUri(
@@ -8234,6 +8299,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string} categoryId Optional.
      * @return {Promise} Resolves: Empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public addRoomToGroupSummary(groupId: string, roomId: string, categoryId: string): Promise<any> {
         const path = utils.encodeUri(
@@ -8250,6 +8316,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string} roomId
      * @return {Promise} Resolves: Empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public removeRoomFromGroupSummary(groupId: string, roomId: string): Promise<any> {
         const path = utils.encodeUri(
@@ -8265,6 +8332,7 @@ export class MatrixClient extends EventEmitter {
      * @param {boolean} isPublic Whether the room-group association is visible to non-members
      * @return {Promise} Resolves: Empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public addRoomToGroup(groupId: string, roomId: string, isPublic: boolean): Promise<any> {
         if (isPublic === undefined) {
@@ -8286,6 +8354,7 @@ export class MatrixClient extends EventEmitter {
      * @param {boolean} isPublic Whether the room-group association is visible to non-members
      * @return {Promise} Resolves: Empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public updateGroupRoomVisibility(groupId: string, roomId: string, isPublic: boolean): Promise<any> {
         // NB: The /config API is generic but there's not much point in exposing this yet as synapse
@@ -8306,6 +8375,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string} roomId
      * @return {Promise} Resolves: Empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public removeRoomFromGroup(groupId: string, roomId: string): Promise<any> {
         const path = utils.encodeUri(
@@ -8320,6 +8390,7 @@ export class MatrixClient extends EventEmitter {
      * @param {Object} opts Additional options to send alongside the acceptance.
      * @return {Promise} Resolves: Empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public acceptGroupInvite(groupId: string, opts = null): Promise<any> {
         const path = utils.encodeUri(
@@ -8333,6 +8404,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string} groupId
      * @return {Promise} Resolves: Empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public joinGroup(groupId: string): Promise<any> {
         const path = utils.encodeUri(
@@ -8346,6 +8418,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string} groupId
      * @return {Promise} Resolves: Empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public leaveGroup(groupId: string): Promise<any> {
         const path = utils.encodeUri(
@@ -8358,6 +8431,7 @@ export class MatrixClient extends EventEmitter {
     /**
      * @return {Promise} Resolves: The groups to which the user is joined
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public getJoinedGroups(): Promise<any> {
         const path = utils.encodeUri("/joined_groups", {});
@@ -8370,6 +8444,7 @@ export class MatrixClient extends EventEmitter {
      * @param {Object} content.profile Group profile object
      * @return {Promise} Resolves: Object with key group_id: id of the created group
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public createGroup(content: any): Promise<any> {
         const path = utils.encodeUri("/create_group", {});
@@ -8390,6 +8465,7 @@ export class MatrixClient extends EventEmitter {
      *         }
      *     }
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public getPublicisedGroups(userIds: string[]): Promise<any> {
         const path = utils.encodeUri("/publicised_groups", {});
@@ -8403,6 +8479,7 @@ export class MatrixClient extends EventEmitter {
      * @param {boolean} isPublic Whether the user's membership of this group is made public
      * @return {Promise} Resolves: Empty object
      * @return {module:http-api.MatrixError} Rejects: with an error response.
+     * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
      */
     public setGroupPublicity(groupId: string, isPublic: boolean): Promise<any> {
         const path = utils.encodeUri(
@@ -8567,6 +8644,7 @@ export class MatrixClient extends EventEmitter {
  * is experimental and may change.</strong>
  * @event module:client~MatrixClient#"Group"
  * @param {Group} group The newly created, fully populated group.
+ * @deprecated groups/communities never made it to the spec and support for them is being discontinued.
  * @example
  * matrixClient.on("Group", function(group){
  *   var groupId = group.groupId;
