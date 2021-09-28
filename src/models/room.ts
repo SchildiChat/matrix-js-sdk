@@ -32,10 +32,10 @@ import { logger } from '../logger';
 import { ReEmitter } from '../ReEmitter';
 import { EventType, RoomCreateTypeField, RoomType, UNSTABLE_ELEMENT_FUNCTIONAL_USERS } from "../@types/event";
 import { IRoomVersionsCapability, MatrixClient, PendingEventOrdering, RoomVersionStability } from "../client";
-import { JoinRule, ResizeMethod } from "../@types/partials";
+import { GuestAccess, HistoryVisibility, JoinRule, ResizeMethod } from "../@types/partials";
 import { Filter } from "../filter";
 import { RoomState } from "./room-state";
-import { Thread } from "./thread";
+import { Thread, ThreadEvent } from "./thread";
 
 // These constants are used as sane defaults when the homeserver doesn't support
 // the m.room_versions capability. In practice, KNOWN_SAFE_ROOM_VERSION should be
@@ -1074,9 +1074,9 @@ export class Room extends EventEmitter {
     public addThread(thread: Thread): Set<Thread> {
         this.threads.add(thread);
         if (!thread.ready) {
-            thread.once("Thread.ready", this.dedupeThreads);
-            this.emit("Thread.update", thread);
-            this.reEmitter.reEmit(thread, ["Thread.update", "Thread.ready"]);
+            thread.once(ThreadEvent.Ready, this.dedupeThreads);
+            this.emit(ThreadEvent.Update, thread);
+            this.reEmitter.reEmit(thread, [ThreadEvent.Update, ThreadEvent.Ready]);
         }
         return this.threads;
     }
@@ -1305,12 +1305,14 @@ export class Room extends EventEmitter {
                 this.handleRemoteEcho(event, existingEvent);
             }
         }
-
-        let thread = this.findEventById(event.replyEventId)?.getThread();
+        let thread = this.findEventById(event.parentEventId)?.getThread();
         if (thread) {
             thread.addEvent(event);
         } else {
             thread = new Thread([event], this, this.client);
+        }
+
+        if (!this.threads.has(thread)) {
             this.addThread(thread);
         }
     }
@@ -1411,6 +1413,13 @@ export class Room extends EventEmitter {
      * unique transaction id.
      */
     public addPendingEvent(event: MatrixEvent, txnId: string): void {
+        // TODO: Enable "pending events" for threads
+        // There's a fair few things to update to make them work with Threads
+        // Will get back to it when the plan is to build a more polished UI ready for production
+        if (this.client?.supportsExperimentalThreads() && event.replyInThread) {
+            return;
+        }
+
         if (event.status !== EventStatus.SENDING && event.status !== EventStatus.NOT_SENT) {
             throw new Error("addPendingEvent called on an event with status " +
                 event.status);
@@ -1581,6 +1590,14 @@ export class Room extends EventEmitter {
 
         this.emit("Room.localEchoUpdated", localEvent, this,
             oldEventId, oldStatus);
+    }
+
+    public findThreadByEventId(eventId: string): Thread {
+        for (const thread of this.threads) {
+            if (thread.has(eventId)) {
+                return thread;
+            }
+        }
     }
 
     /**
@@ -2065,6 +2082,22 @@ export class Room extends EventEmitter {
      */
     public getJoinRule(): JoinRule {
         return this.currentState.getJoinRule();
+    }
+
+    /**
+     * Returns the history visibility based on the m.room.history_visibility state event, defaulting to `shared`.
+     * @returns {HistoryVisibility} the history_visibility applied to this room
+     */
+    public getHistoryVisibility(): HistoryVisibility {
+        return this.currentState.getHistoryVisibility();
+    }
+
+    /**
+     * Returns the history visibility based on the m.room.history_visibility state event, defaulting to `shared`.
+     * @returns {HistoryVisibility} the history_visibility applied to this room
+     */
+    public getGuestAccess(): GuestAccess {
+        return this.currentState.getGuestAccess();
     }
 
     /**

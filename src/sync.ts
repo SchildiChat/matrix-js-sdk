@@ -315,7 +315,19 @@ export class SyncApi {
     public partitionThreadedEvents(events: MatrixEvent[]): [MatrixEvent[], MatrixEvent[]] {
         if (this.opts.experimentalThreadSupport) {
             return events.reduce((memo, event: MatrixEvent) => {
-                memo[event.replyInThread ? 1 : 0].push(event);
+                const room = this.client.getRoom(event.getRoomId());
+                // An event should live in the thread timeline if
+                // - It's a reply in thread event
+                // - It's related to a reply in thread event
+                let shouldLiveInThreadTimeline = event.replyInThread;
+                if (!shouldLiveInThreadTimeline) {
+                    const parentEventId = event.getWireContent()["m.relates_to"]?.event_id;
+                    const parentEvent = room?.findEventById(parentEventId) || events.find((mxEv: MatrixEvent) => {
+                        return mxEv.getId() === parentEventId;
+                    });
+                    shouldLiveInThreadTimeline = parentEvent?.replyInThread;
+                }
+                memo[shouldLiveInThreadTimeline ? 1 : 0].push(event);
                 return memo;
             }, [[], []]);
         } else {
@@ -704,7 +716,11 @@ export class SyncApi {
      */
     public stop(): void {
         debuglog("SyncApi.stop");
-        if (global.window) {
+        // It is necessary to check for the existance of
+        // global.window AND global.window.removeEventListener.
+        // Some platforms (e.g. React Native) register global.window,
+        // but do not have global.window.removeEventListener.
+        if (global.window && global.window.removeEventListener) {
             global.window.removeEventListener("online", this.onOnline, false);
         }
         this.running = false;

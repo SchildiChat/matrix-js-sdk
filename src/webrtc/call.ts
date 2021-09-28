@@ -128,7 +128,9 @@ export enum CallEvent {
 
     AssertedIdentityChanged = 'asserted_identity_changed',
 
-    LengthChanged = 'length_changed'
+    LengthChanged = 'length_changed',
+
+    DataChannel = 'datachannel',
 }
 
 export enum CallErrorCode {
@@ -212,11 +214,6 @@ export enum CallErrorCode {
     Transfered = 'transferred',
 }
 
-enum ConstraintsType {
-    Audio = "audio",
-    Video = "video",
-}
-
 /**
  * The version field that we set in m.call.* events
  */
@@ -227,21 +224,6 @@ const FALLBACK_ICE_SERVER = 'stun:turn.matrix.org';
 
 /** The length of time a call can be ringing for. */
 const CALL_TIMEOUT_MS = 60000;
-
-/** Retrieves sources from desktopCapturer */
-export function getDesktopCapturerSources(): Promise<Array<DesktopCapturerSource>> {
-    const options: GetSourcesOptions = {
-        thumbnailSize: {
-            height: 176,
-            width: 312,
-        },
-        types: [
-            "screen",
-            "window",
-        ],
-    };
-    return window.electron.getDesktopCapturerSources(options);
-}
 
 export class CallError extends Error {
     code: string;
@@ -271,7 +253,6 @@ function genCallID(): string {
  */
 export class MatrixCall extends EventEmitter {
     public roomId: string;
-    public type: CallType = null;
     public callId: string;
     public state = CallState.Fledgling;
     public hangupParty: CallParty;
@@ -352,11 +333,7 @@ export class MatrixCall extends EventEmitter {
      * @throws If you have not specified a listener for 'error' events.
      */
     public async placeVoiceCall(): Promise<void> {
-        logger.debug("placeVoiceCall");
-        this.checkForErrorListener();
-        const constraints = getUserMediaContraints(ConstraintsType.Audio);
-        this.type = CallType.Voice;
-        await this.placeCallWithConstraints(constraints);
+        await this.placeCall(true, false);
     }
 
     /**
@@ -364,11 +341,19 @@ export class MatrixCall extends EventEmitter {
      * @throws If you have not specified a listener for 'error' events.
      */
     public async placeVideoCall(): Promise<void> {
-        logger.debug("placeVideoCall");
-        this.checkForErrorListener();
-        const constraints = getUserMediaContraints(ConstraintsType.Video);
-        this.type = CallType.Video;
-        await this.placeCallWithConstraints(constraints);
+        await this.placeCall(true, true);
+    }
+
+    /**
+     * Create a datachannel using this call's peer connection.
+     * @param label A human readable label for this datachannel
+     * @param options An object providing configuration options for the data channel.
+     */
+    public createDataChannel(label: string, options: RTCDataChannelInit) {
+        const dataChannel = this.peerConn.createDataChannel(label, options);
+        this.emit(CallEvent.DataChannel, dataChannel);
+        logger.debug("created data channel");
+        return dataChannel;
     }
 
     public getOpponentMember(): RoomMember {
@@ -385,6 +370,25 @@ export class MatrixCall extends EventEmitter {
 
     public getRemoteAssertedIdentity(): AssertedIdentity {
         return this.remoteAssertedIdentity;
+    }
+
+    public get type(): CallType {
+        return (this.hasLocalUserMediaVideoTrack || this.hasRemoteUserMediaVideoTrack)
+            ? CallType.Video
+            : CallType.Voice;
+    }
+
+    public get hasLocalUserMediaVideoTrack(): boolean {
+        return this.localUsermediaStream?.getVideoTracks().length > 0;
+    }
+
+    public get hasRemoteUserMediaVideoTrack(): boolean {
+        return this.getRemoteFeeds().some((feed) => {
+            return (
+                feed.purpose === SDPStreamMetadataPurpose.Usermedia &&
+                feed.stream.getVideoTracks().length > 0
+            );
+        });
     }
 
     public get localUsermediaFeed(): CallFeed {
@@ -558,6 +562,10 @@ export class MatrixCall extends EventEmitter {
     }
 
     private deleteAllFeeds(): void {
+        for (const feed of this.feeds) {
+            feed.dispose();
+        }
+
         this.feeds = [];
         this.emit(CallEvent.FeedsChanged, this.feeds);
     }
@@ -571,6 +579,7 @@ export class MatrixCall extends EventEmitter {
             return;
         }
 
+        feed.dispose();
         this.feeds.splice(this.feeds.indexOf(feed), 1);
         this.emit(CallEvent.FeedsChanged, this.feeds);
     }
@@ -645,8 +654,6 @@ export class MatrixCall extends EventEmitter {
             return;
         }
 
-        this.type = remoteStream.getTracks().some(t => t.kind === 'video') ? CallType.Video : CallType.Voice;
-
         this.setState(CallState.Ringing);
 
         if (event.getLocalAge()) {
@@ -684,20 +691,17 @@ export class MatrixCall extends EventEmitter {
             return;
         }
 
-        logger.debug(`Answering call ${this.callId} of type ${this.type}`);
+        logger.debug(`Answering call ${this.callId}`);
 
         if (!this.localUsermediaStream && !this.waitForLocalAVStream) {
-            const constraints = getUserMediaContraints(
-                this.type == CallType.Video ?
-                    ConstraintsType.Video:
-                    ConstraintsType.Audio,
-            );
-            logger.log("Getting user media with constraints", constraints);
             this.setState(CallState.WaitLocalMedia);
             this.waitForLocalAVStream = true;
 
             try {
-                const mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+                const mediaStream = await this.client.getMediaHandler().getUserMediaStream(
+                    true,
+                    this.hasRemoteUserMediaVideoTrack,
+                );
                 this.waitForLocalAVStream = false;
                 this.gotUserMediaForAnswer(mediaStream);
             } catch (e) {
@@ -789,12 +793,11 @@ export class MatrixCall extends EventEmitter {
     /**
      * Starts/stops screensharing
      * @param enabled the desired screensharing state
-     * @param selectDesktopCapturerSource callBack to select a screensharing stream on desktop
+     * @param {string} desktopCapturerSourceId optional id of the desktop capturer source to use
      * @returns {boolean} new screensharing state
      */
     public async setScreensharingEnabled(
-        enabled: boolean,
-        selectDesktopCapturerSource?: () => Promise<DesktopCapturerSource>,
+        enabled: boolean, desktopCapturerSourceId?: string,
     ): Promise<boolean> {
         // Skip if there is nothing to do
         if (enabled && this.isScreensharing()) {
@@ -807,13 +810,13 @@ export class MatrixCall extends EventEmitter {
 
         // Fallback to replaceTrack()
         if (!this.opponentSupportsSDPStreamMetadata()) {
-            return await this.setScreensharingEnabledWithoutMetadataSupport(enabled, selectDesktopCapturerSource);
+            return await this.setScreensharingEnabledWithoutMetadataSupport(enabled, desktopCapturerSourceId);
         }
 
         logger.debug(`Set screensharing enabled? ${enabled}`);
         if (enabled) {
             try {
-                const stream = await getScreensharingStream(selectDesktopCapturerSource);
+                const stream = await this.client.getMediaHandler().getScreensharingStream(desktopCapturerSourceId);
                 if (!stream) return false;
                 this.pushLocalFeed(stream, SDPStreamMetadataPurpose.Screenshare);
                 return true;
@@ -827,9 +830,7 @@ export class MatrixCall extends EventEmitter {
             for (const sender of this.screensharingSenders) {
                 this.peerConn.removeTrack(sender);
             }
-            for (const track of this.localScreensharingStream.getTracks()) {
-                track.stop();
-            }
+            this.client.getMediaHandler().stopScreensharingStream(this.localScreensharingStream);
             this.deleteFeedByStream(this.localScreensharingStream);
             return false;
         }
@@ -839,17 +840,16 @@ export class MatrixCall extends EventEmitter {
      * Starts/stops screensharing
      * Should be used ONLY if the opponent doesn't support SDPStreamMetadata
      * @param enabled the desired screensharing state
-     * @param selectDesktopCapturerSource callBack to select a screensharing stream on desktop
+     * @param {string} desktopCapturerSourceId optional id of the desktop capturer source to use
      * @returns {boolean} new screensharing state
      */
     private async setScreensharingEnabledWithoutMetadataSupport(
-        enabled: boolean,
-        selectDesktopCapturerSource?: () => Promise<DesktopCapturerSource>,
+        enabled: boolean, desktopCapturerSourceId?: string,
     ): Promise<boolean> {
         logger.debug(`Set screensharing enabled? ${enabled} using replaceTrack()`);
         if (enabled) {
             try {
-                const stream = await getScreensharingStream(selectDesktopCapturerSource);
+                const stream = await this.client.getMediaHandler().getScreensharingStream(desktopCapturerSourceId);
                 if (!stream) return false;
 
                 const track = stream.getTracks().find((track) => {
@@ -878,9 +878,7 @@ export class MatrixCall extends EventEmitter {
             });
             sender.replaceTrack(track);
 
-            for (const track of this.localScreensharingStream.getTracks()) {
-                track.stop();
-            }
+            this.client.getMediaHandler().stopScreensharingStream(this.localScreensharingStream);
             this.deleteFeedByStream(this.localScreensharingStream);
 
             return false;
@@ -1019,7 +1017,7 @@ export class MatrixCall extends EventEmitter {
         this.pushLocalFeed(stream, SDPStreamMetadataPurpose.Usermedia);
         this.setState(CallState.CreateOffer);
 
-        logger.debug("gotUserMediaForInvite -> " + this.type);
+        logger.debug("gotUserMediaForInvite");
         // Now we wait for the negotiationneeded event
     };
 
@@ -1511,6 +1509,10 @@ export class MatrixCall extends EventEmitter {
         stream.addEventListener("removetrack", () => this.deleteFeedByStream(stream));
     };
 
+    private onDataChannel = (ev: RTCDataChannelEvent): void => {
+        this.emit(CallEvent.DataChannel, ev.channel);
+    };
+
     /**
      * This method removes all video/rtx codecs from screensharing video
      * transceivers. This is necessary since they can cause problems. Without
@@ -1763,8 +1765,14 @@ export class MatrixCall extends EventEmitter {
         logger.debug(`stopAllMedia (stream=${this.localUsermediaStream})`);
 
         for (const feed of this.feeds) {
-            for (const track of feed.stream.getTracks()) {
-                track.stop();
+            if (feed.isLocal() && feed.purpose === SDPStreamMetadataPurpose.Usermedia) {
+                this.client.getMediaHandler().stopUserMediaStream(feed.stream);
+            } else if (feed.isLocal() && feed.purpose === SDPStreamMetadataPurpose.Screenshare) {
+                this.client.getMediaHandler().stopScreensharingStream(feed.stream);
+            } else {
+                for (const track of feed.stream.getTracks()) {
+                    track.stop();
+                }
             }
         }
     }
@@ -1826,8 +1834,17 @@ export class MatrixCall extends EventEmitter {
         }
     }
 
-    private async placeCallWithConstraints(constraints: MediaStreamConstraints): Promise<void> {
-        logger.log("Getting user media with constraints", constraints);
+    /**
+     * Place a call to this room.
+     * @throws if you have not specified a listener for 'error' events.
+     * @throws if have passed audio=false.
+     */
+    public async placeCall(audio: boolean, video: boolean): Promise<void> {
+        logger.debug(`placeCall audio=${audio} video=${video}`);
+        if (!audio) {
+            throw new Error("You CANNOT start a call without audio");
+        }
+        this.checkForErrorListener();
         // XXX Find a better way to do this
         this.client.callEventHandler.calls.set(this.callId, this);
         this.setState(CallState.WaitLocalMedia);
@@ -1845,7 +1862,7 @@ export class MatrixCall extends EventEmitter {
         this.peerConn = this.createPeerConnection();
 
         try {
-            const mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+            const mediaStream = await this.client.getMediaHandler().getUserMediaStream(audio, video);
             this.gotUserMediaForInvite(mediaStream);
         } catch (e) {
             this.getUserMediaFailed(e);
@@ -1867,6 +1884,7 @@ export class MatrixCall extends EventEmitter {
         pc.addEventListener('icegatheringstatechange', this.onIceGatheringStateChange);
         pc.addEventListener('track', this.onTrack);
         pc.addEventListener('negotiationneeded', this.onNegotiationNeeded);
+        pc.addEventListener('datachannel', this.onDataChannel);
 
         return pc;
     }
@@ -1939,104 +1957,11 @@ export class MatrixCall extends EventEmitter {
     }
 }
 
-async function getScreensharingStream(
-    selectDesktopCapturerSource?: () => Promise<DesktopCapturerSource>,
-): Promise<MediaStream> {
-    const screenshareConstraints = await getScreenshareContraints(selectDesktopCapturerSource);
-    if (!screenshareConstraints) return null;
-
-    if (window.electron?.getDesktopCapturerSources) {
-        // We are using Electron
-        logger.debug("Getting screen stream using getUserMedia()...");
-        return await navigator.mediaDevices.getUserMedia(screenshareConstraints);
-    } else {
-        // We are not using Electron
-        logger.debug("Getting screen stream using getDisplayMedia()...");
-        return await navigator.mediaDevices.getDisplayMedia(screenshareConstraints);
-    }
-}
-
 function setTracksEnabled(tracks: Array<MediaStreamTrack>, enabled: boolean): void {
     for (let i = 0; i < tracks.length; i++) {
         tracks[i].enabled = enabled;
     }
 }
-
-function getUserMediaContraints(type: ConstraintsType): MediaStreamConstraints {
-    const isWebkit = !!navigator.webkitGetUserMedia;
-
-    switch (type) {
-        case ConstraintsType.Audio: {
-            return {
-                audio: {
-                    deviceId: audioInput ? { ideal: audioInput } : undefined,
-                },
-                video: false,
-            };
-        }
-        case ConstraintsType.Video: {
-            return {
-                audio: {
-                    deviceId: audioInput ? { ideal: audioInput } : undefined,
-                }, video: {
-                    deviceId: videoInput ? { ideal: videoInput } : undefined,
-                    /* We want 640x360.  Chrome will give it only if we ask exactly,
-                       FF refuses entirely if we ask exactly, so have to ask for ideal
-                       instead
-                       XXX: Is this still true?
-                     */
-                    width: isWebkit ? { exact: 640 } : { ideal: 640 },
-                    height: isWebkit ? { exact: 360 } : { ideal: 360 },
-                },
-            };
-        }
-    }
-}
-
-async function getScreenshareContraints(
-    selectDesktopCapturerSource?: () => Promise<DesktopCapturerSource>,
-): Promise<DesktopCapturerConstraints> {
-    if (window.electron?.getDesktopCapturerSources && selectDesktopCapturerSource) {
-        // We have access to getDesktopCapturerSources()
-        logger.debug("Electron getDesktopCapturerSources() is available...");
-        const selectedSource = await selectDesktopCapturerSource();
-        if (!selectedSource) return null;
-        return {
-            audio: false,
-            video: {
-                mandatory: {
-                    chromeMediaSource: "desktop",
-                    chromeMediaSourceId: selectedSource.id,
-                },
-            },
-        };
-    } else {
-        // We do not have access to the Electron desktop capturer,
-        // therefore we can assume we are on the web
-        logger.debug("Electron desktopCapturer is not available...");
-        return {
-            audio: false,
-            video: true,
-        };
-    }
-}
-
-let audioInput: string;
-let videoInput: string;
-/**
- * Set an audio input device to use for MatrixCalls
- * @function
- * @param {string=} deviceId the identifier for the device
- * undefined treated as unset
- */
-export function setAudioInput(deviceId: string): void { audioInput = deviceId; }
-/**
- * Set a video input device to use for MatrixCalls
- * @function
- * @param {string=} deviceId the identifier for the device
- * undefined treated as unset
- */
-export function setVideoInput(deviceId: string): void { videoInput = deviceId; }
 
 /**
  * DEPRECATED

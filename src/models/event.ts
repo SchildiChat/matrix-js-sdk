@@ -33,7 +33,7 @@ import {
 import { Crypto } from "../crypto";
 import { deepSortedObjectEntries } from "../utils";
 import { RoomMember } from "./room-member";
-import { Thread } from "./thread";
+import { Thread, ThreadEvent } from "./thread";
 import { IActionsObject } from '../pushprocessor';
 import { ReEmitter } from '../ReEmitter';
 
@@ -418,6 +418,11 @@ export class MatrixEvent extends EventEmitter {
         return (this.replyEventId
             && replyTo[UNSTABLE_ELEMENT_REPLY_IN_THREAD.name])
             || this.thread instanceof Thread;
+    }
+
+    public get parentEventId(): string {
+        return this.replyEventId
+            || this.getWireContent()["m.relates_to"]?.event_id;
     }
 
     /**
@@ -1316,7 +1321,7 @@ export class MatrixEvent extends EventEmitter {
      */
     public setThread(thread: Thread): void {
         this.thread = thread;
-        this.reEmitter.reEmit(thread, ["Thread.ready", "Thread.update"]);
+        this.reEmitter.reEmit(thread, [ThreadEvent.Ready, ThreadEvent.Update]);
     }
 
     /**

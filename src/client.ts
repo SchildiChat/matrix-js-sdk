@@ -31,9 +31,10 @@ import { sleep } from './utils';
 import { Group } from "./models/group";
 import { Direction, EventTimeline } from "./models/event-timeline";
 import { IActionsObject, PushProcessor } from "./pushprocessor";
-import { AutoDiscovery } from "./autodiscovery";
+import { AutoDiscovery, AutoDiscoveryAction } from "./autodiscovery";
 import * as olmlib from "./crypto/olmlib";
 import { decodeBase64, encodeBase64 } from "./crypto/olmlib";
+import { IExportedDevice as IOlmDevice } from "./crypto/OlmDevice";
 import { ReEmitter } from './ReEmitter';
 import { IRoomEncryption, RoomList } from './crypto/RoomList';
 import { logger } from './logger';
@@ -74,7 +75,6 @@ import {
     IKeyBackupPrepareOpts,
     IKeyBackupRestoreOpts,
     IKeyBackupRestoreResult,
-    IKeyBackupSession,
 } from "./crypto/keybackup";
 import { IIdentityServerProvider } from "./@types/IIdentityServerProvider";
 import type Request from "request";
@@ -92,7 +92,7 @@ import {
 import { SyncState } from "./sync.api";
 import { EventTimelineSet } from "./models/event-timeline-set";
 import { VerificationRequest } from "./crypto/verification/request/VerificationRequest";
-import { Base as Verification } from "./crypto/verification/Base";
+import { VerificationBase as Verification } from "./crypto/verification/Base";
 import * as ContentHelpers from "./content-helpers";
 import { CrossSigningInfo, DeviceTrustLevel, ICacheCallbacks, UserTrustLevel } from "./crypto/CrossSigning";
 import { Room } from "./models/room";
@@ -144,6 +144,7 @@ import { IHierarchyRoom, ISpaceSummaryEvent, ISpaceSummaryRoom } from "./@types/
 import { IPusher, IPusherRequest, IPushRules, PushRuleAction, PushRuleKind, RuleId } from "./@types/PushRules";
 import { IThreepid } from "./@types/threepids";
 import { CryptoStore } from "./crypto/store/base";
+import { MediaHandler } from "./webrtc/mediaHandler";
 
 export type Store = IStore;
 export type SessionStore = WebStorageSessionStore;
@@ -155,12 +156,6 @@ const SCROLLBACK_DELAY_MS = 3000;
 export const CRYPTO_ENABLED: boolean = isCryptoAvailable();
 const CAPABILITIES_CACHE_MS = 21600000; // 6 hours - an arbitrary value
 const TURN_CHECK_INTERVAL = 10 * 60 * 1000; // poll for turn credentials every 10 minutes
-
-interface IOlmDevice {
-    pickledAccount: string;
-    sessions: Array<Record<string, IKeyBackupSession>>;
-    pickleKey: string;
-}
 
 interface IExportedDevice {
     olmDevice: IOlmDevice;
@@ -481,14 +476,19 @@ interface IServerVersions {
     unstable_features: Record<string, boolean>;
 }
 
-interface IClientWellKnown {
+export interface IClientWellKnown {
     [key: string]: any;
-    "m.homeserver": {
-        base_url: string;
-    };
-    "m.identity_server"?: {
-        base_url: string;
-    };
+    "m.homeserver"?: IWellKnownConfig;
+    "m.identity_server"?: IWellKnownConfig;
+}
+
+export interface IWellKnownConfig {
+    raw?: any; // todo typings
+    action?: AutoDiscoveryAction;
+    reason?: string;
+    error?: Error | string;
+    // eslint-disable-next-line
+    base_url?: string | null;
 }
 
 interface IKeyBackupPath {
@@ -678,7 +678,7 @@ export class MatrixClient extends EventEmitter {
     public static readonly RESTORE_BACKUP_ERROR_BAD_KEY = 'RESTORE_BACKUP_ERROR_BAD_KEY';
 
     public reEmitter = new ReEmitter(this);
-    public olmVersion: string = null; // populated after initCrypto
+    public olmVersion: [number, number, number] = null; // populated after initCrypto
     public usingExternalCrypto = false;
     public store: Store;
     public deviceId?: string;
@@ -739,6 +739,7 @@ export class MatrixClient extends EventEmitter {
     protected checkTurnServersIntervalID: number;
     protected exportedOlmDeviceToImport: IOlmDevice;
     protected txnCtr = 0;
+    protected mediaHandler = new MediaHandler();
 
     constructor(opts: IMatrixClientCreateOpts) {
         super();
@@ -1244,6 +1245,13 @@ export class MatrixClient extends EventEmitter {
      */
     public supportsVoip(): boolean {
         return this.canSupportVoip;
+    }
+
+    /**
+     * @returns {MediaHandler}
+     */
+    public getMediaHandler(): MediaHandler {
+        return this.mediaHandler;
     }
 
     /**
@@ -2033,7 +2041,7 @@ export class MatrixClient extends EventEmitter {
      *     recovery key which should be disposed of after displaying to the user,
      *     and raw private key to avoid round tripping if needed.
      */
-    public createRecoveryKeyFromPassphrase(password: string): Promise<IRecoveryKey> {
+    public createRecoveryKeyFromPassphrase(password?: string): Promise<IRecoveryKey> {
         if (!this.crypto) {
             throw new Error("End-to-end encryption disabled");
         }
@@ -2476,7 +2484,7 @@ export class MatrixClient extends EventEmitter {
      */
     // TODO: Verify types
     public async prepareKeyBackupVersion(
-        password: string,
+        password?: string,
         opts: IKeyBackupPrepareOpts = { secureSecretStorage: false },
     ): Promise<Pick<IPreparedKeyBackupVersion, "algorithm" | "auth_data" | "recovery_key">> {
         if (!this.crypto) {
@@ -6113,17 +6121,17 @@ export class MatrixClient extends EventEmitter {
     public register(
         username: string,
         password: string,
-        sessionId: string,
-        auth: any,
-        bindThreepids: any,
-        guestAccessToken: string,
-        inhibitLogin: boolean,
+        sessionId: string | null,
+        auth: { session?: string, type: string },
+        bindThreepids?: boolean | null | { email?: boolean, msisdn?: boolean },
+        guestAccessToken?: string,
+        inhibitLogin?: boolean,
         callback?: Callback,
     ): Promise<any> { // TODO: Types (many)
         // backwards compat
         if (bindThreepids === true) {
             bindThreepids = { email: true };
-        } else if (bindThreepids === null || bindThreepids === undefined) {
+        } else if (bindThreepids === null || bindThreepids === undefined || bindThreepids === false) {
             bindThreepids = {};
         }
         if (typeof inhibitLogin === 'function') {
@@ -7457,7 +7465,7 @@ export class MatrixClient extends EventEmitter {
         return this.http.authedRequest(undefined, "GET", path, qps, undefined);
     }
 
-    public uploadDeviceSigningKeys(auth: any, keys: CrossSigningKeys): Promise<{}> { // TODO: types
+    public uploadDeviceSigningKeys(auth: any, keys?: CrossSigningKeys): Promise<{}> { // TODO: types
         const data = Object.assign({}, keys);
         if (auth) Object.assign(data, { auth });
         return this.http.authedRequest(
@@ -8494,6 +8502,13 @@ export class MatrixClient extends EventEmitter {
         return this.http.authedRequest(undefined, "PUT", path, undefined, {
             publicise: isPublic,
         });
+    }
+
+    /**
+     * @experimental
+     */
+    public supportsExperimentalThreads(): boolean {
+        return this.clientOpts?.experimentalThreadSupport || false;
     }
 }
 
