@@ -671,6 +671,12 @@ interface IThirdPartyUser {
     protocol: string;
     fields: object;
 }
+
+interface IRoomSummary extends Omit<IPublicRoomsChunkRoom, "canonical_alias" | "aliases"> {
+    room_type?: RoomType;
+    membership?: string;
+    is_encrypted: boolean;
+}
 /* eslint-enable camelcase */
 
 /**
@@ -1749,6 +1755,7 @@ export class MatrixClient extends EventEmitter {
      * @param {string} deviceId the device to verify
      *
      * @returns {Verification} a verification object
+     * @deprecated Use `requestVerification` instead.
      */
     public beginKeyVerification(method: string, userId: string, deviceId: string): Verification {
         if (!this.crypto) {
@@ -1911,6 +1918,7 @@ export class MatrixClient extends EventEmitter {
         return this.crypto.checkCrossSigningPrivateKey(privateKey, expectedPublicKey);
     }
 
+    // deprecated: use requestVerification instead
     public legacyDeviceVerification(
         userId: string,
         deviceId: string,
@@ -3397,7 +3405,7 @@ export class MatrixClient extends EventEmitter {
     /**
      * @param {string} roomId
      * @param {object} eventObject An object with the partial structure of an event, to which event_id, user_id, room_id and origin_server_ts will be added.
-     * @param {string} txnId the txnId.
+     * @param {string} txnId Optional.
      * @param {module:client.callback} callback Optional.
      * @return {Promise} Resolves: to an empty object {}
      * @return {module:http-api.MatrixError} Rejects: with an error response.
@@ -3405,7 +3413,7 @@ export class MatrixClient extends EventEmitter {
     private sendCompleteEvent(
         roomId: string,
         eventObject: any,
-        txnId: string,
+        txnId?: string,
         callback?: Callback,
     ): Promise<ISendEventResponse> {
         if (utils.isFunction(txnId)) {
@@ -5414,6 +5422,14 @@ export class MatrixClient extends EventEmitter {
         const resultsLength = roomEvents.results ? roomEvents.results.length : 0;
         for (let i = 0; i < resultsLength; i++) {
             const sr = SearchResult.fromJson(roomEvents.results[i], this.getEventMapper());
+            const room = this.getRoom(sr.context.getEvent().getRoomId());
+            if (room) {
+                // Copy over a known event sender if we can
+                for (const ev of sr.context.getTimeline()) {
+                    const sender = room.getMember(ev.getSender());
+                    if (!ev.sender && sender) ev.sender = sender;
+                }
+            }
             searchResults.results.push(sr);
         }
         return searchResults;
@@ -8520,6 +8536,20 @@ export class MatrixClient extends EventEmitter {
      */
     public supportsExperimentalThreads(): boolean {
         return this.clientOpts?.experimentalThreadSupport || false;
+    }
+
+    /**
+     * Fetches the summary of a room as defined by an initial version of MSC3266 and implemented in Synapse
+     * Proposed at https://github.com/matrix-org/matrix-doc/pull/3266
+     * @param {string} roomIdOrAlias The ID or alias of the room to get the summary of.
+     * @param {string[]?} via The list of servers which know about the room if only an ID was provided.
+     */
+    public async getRoomSummary(roomIdOrAlias: string, via?: string[]): Promise<IRoomSummary> {
+        const path = utils.encodeUri("/rooms/$roomid/summary", { $roomid: roomIdOrAlias });
+        return this.http.authedRequest(undefined, "GET", path, { via }, null, {
+            qsStringifyOptions: { arrayFormat: 'repeat' },
+            prefix: "/_matrix/client/unstable/im.nheko.summary",
+        });
     }
 }
 
