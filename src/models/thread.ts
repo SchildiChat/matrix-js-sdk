@@ -19,7 +19,7 @@ import { MatrixEvent } from "./event";
 import { EventTimeline } from "./event-timeline";
 import { EventTimelineSet } from './event-timeline-set';
 import { Room } from './room';
-import { BaseModel } from "./base-model";
+import { TypedEventEmitter } from "./typed-event-emitter";
 
 export enum ThreadEvent {
     New = "Thread.new",
@@ -30,7 +30,7 @@ export enum ThreadEvent {
 /**
  * @experimental
  */
-export class Thread extends BaseModel<ThreadEvent> {
+export class Thread extends TypedEventEmitter<ThreadEvent> {
     /**
      * A reference to the event ID at the top of the thread
      */
@@ -39,6 +39,8 @@ export class Thread extends BaseModel<ThreadEvent> {
      * A reference to all the events ID at the bottom of the threads
      */
     public readonly timelineSet;
+
+    private _currentUserParticipated = false;
 
     constructor(
         events: MatrixEvent[] = [],
@@ -53,10 +55,19 @@ export class Thread extends BaseModel<ThreadEvent> {
         this.timelineSet = new EventTimelineSet(this.room, {
             unstableClientRelationAggregation: true,
             timelineSupport: true,
-            pendingEvents: false,
+            pendingEvents: true,
         });
         events.forEach(event => this.addEvent(event));
+
+        room.on("Room.localEchoUpdated", this.onEcho);
+        room.on("Room.timeline", this.onEcho);
     }
+
+    onEcho = (event: MatrixEvent) => {
+        if (this.timelineSet.eventIdToTimeline(event.getId())) {
+            this.emit(ThreadEvent.Update, this);
+        }
+    };
 
     /**
      * Add an event to the thread and updates
@@ -92,9 +103,11 @@ export class Thread extends BaseModel<ThreadEvent> {
             roomState,
         );
 
-        if (this.ready) {
-            this.client.decryptEventIfNeeded(event, {});
+        if (!this._currentUserParticipated && event.getSender() === this.client.getUserId()) {
+            this._currentUserParticipated = true;
         }
+
+        await this.client.decryptEventIfNeeded(event, {});
         this.emit(ThreadEvent.Update, this);
     }
 
@@ -112,13 +125,6 @@ export class Thread extends BaseModel<ThreadEvent> {
         const threadReplies = this.events
             .filter(event => event.isThreadRelation);
         return threadReplies[threadReplies.length - 1];
-    }
-
-    /**
-     * Determines thread's ready status
-     */
-    public get ready(): boolean {
-        return this.rootEvent !== undefined;
     }
 
     /**
@@ -151,17 +157,6 @@ export class Thread extends BaseModel<ThreadEvent> {
     }
 
     /**
-     * A set of mxid participating to the thread
-     */
-    public get participants(): Set<string> {
-        const participants = new Set<string>();
-        this.events.forEach(event => {
-            participants.add(event.getSender());
-        });
-        return participants;
-    }
-
-    /**
      * A getter for the last event added to the thread
      */
     public get replyToEvent(): MatrixEvent {
@@ -182,5 +177,9 @@ export class Thread extends BaseModel<ThreadEvent> {
 
     public has(eventId: string): boolean {
         return this.timelineSet.findEventById(eventId) instanceof MatrixEvent;
+    }
+
+    public get hasCurrentUserParticipated(): boolean {
+        return this._currentUserParticipated;
     }
 }
