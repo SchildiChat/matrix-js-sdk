@@ -20,6 +20,8 @@ limitations under the License.
  */
 
 import { EventEmitter } from "events";
+import { ReadStream } from "fs";
+
 import { ISyncStateData, SyncApi } from "./sync";
 import { EventStatus, IContent, IDecryptOptions, IEvent, MatrixEvent } from "./models/event";
 import { StubStore } from "./store/stub";
@@ -108,6 +110,8 @@ import {
     IPaginateOpts,
     IPresenceOpts,
     IRedactOpts,
+    IRelationsRequestOpts,
+    IRelationsResponse,
     IRoomDirectoryOptions,
     ISearchOpts,
     ISendEventResponse,
@@ -126,7 +130,6 @@ import {
 import { IAbortablePromise, IdServerUnbindResult, IImageInfo, Preset, Visibility } from "./@types/partials";
 import { EventMapper, eventMapperFor, MapperOpts } from "./event-mapper";
 import { randomString } from "./randomstring";
-import { ReadStream } from "fs";
 import { WebStorageSessionStore } from "./store/session/webstorage";
 import { BackupManager, IKeyBackup, IKeyBackupCheck, IPreparedKeyBackupVersion, TrustInfo } from "./crypto/backup";
 import { DEFAULT_TREE_POWER_LEVELS_TEMPLATE, MSC3089TreeSpace } from "./models/MSC3089TreeSpace";
@@ -871,8 +874,7 @@ export class MatrixClient extends EventEmitter {
         // state, such as highlights when the user's name is mentioned.
         this.on("Event.decrypted", (event) => {
             const oldActions = event.getPushActions();
-            const actions = this.pushProcessor.actionsForEvent(event);
-            event.setPushActions(actions); // Might as well while we're here
+            const actions = this.getPushActionsForEvent(event, true);
 
             const room = this.getRoom(event.getRoomId());
             if (!room) return;
@@ -882,10 +884,8 @@ export class MatrixClient extends EventEmitter {
             // Ensure the unread counts are kept up to date if the event is encrypted
             // We also want to make sure that the notification count goes up if we already
             // have encrypted events to avoid other code from resetting 'highlight' to zero.
-            const oldHighlight = oldActions && oldActions.tweaks
-                ? !!oldActions.tweaks.highlight : false;
-            const newHighlight = actions && actions.tweaks
-                ? !!actions.tweaks.highlight : false;
+            const oldHighlight = !!oldActions?.tweaks?.highlight;
+            const newHighlight = !!actions?.tweaks?.highlight;
             if (oldHighlight !== newHighlight || currentCount > 0) {
                 // TODO: Handle mentions received while the client is offline
                 // See also https://github.com/vector-im/element-web/issues/9069
@@ -1424,7 +1424,7 @@ export class MatrixClient extends EventEmitter {
         // We swallow errors because we need a default object anyhow
         return this.http.authedRequest(
             undefined, "GET", "/capabilities",
-        ).catch((e) => {
+        ).catch((e: Error) => {
             logger.error(e);
             return null; // otherwise consume the error
         }).then((r) => {
@@ -3107,7 +3107,7 @@ export class MatrixClient extends EventEmitter {
      * data event.
      * @return {module:http-api.MatrixError} Rejects: with an error response.
      */
-    public async getAccountDataFromServer(eventType: string): Promise<Record<string, any>> {
+    public async getAccountDataFromServer<T extends {[k: string]: any}>(eventType: string): Promise<T> {
         if (this.isInitialSyncComplete()) {
             const event = this.store.getAccountData(eventType);
             if (!event) {
@@ -3202,7 +3202,7 @@ export class MatrixClient extends EventEmitter {
             );
         }
 
-        const queryString = {};
+        const queryString: Record<string, string | string[]> = {};
         if (opts.viaServers) {
             queryString["server_name"] = opts.viaServers;
         }
@@ -3412,7 +3412,7 @@ export class MatrixClient extends EventEmitter {
         content: IContent,
         txnId?: string,
         callback?: Callback,
-    );
+    ): Promise<ISendEventResponse>;
     public sendEvent(
         roomId: string,
         threadId: string | null,
@@ -3420,7 +3420,7 @@ export class MatrixClient extends EventEmitter {
         content: IContent,
         txnId?: string,
         callback?: Callback,
-    )
+    ): Promise<ISendEventResponse>;
     public sendEvent(
         roomId: string,
         threadId: string | null,
@@ -3700,14 +3700,14 @@ export class MatrixClient extends EventEmitter {
         eventId: string,
         txnId?: string | undefined,
         cbOrOpts?: Callback | IRedactOpts,
-    );
+    ): Promise<ISendEventResponse>;
     public redactEvent(
         roomId: string,
         threadId: string | null,
         eventId: string,
         txnId?: string | undefined,
         cbOrOpts?: Callback | IRedactOpts,
-    );
+    ): Promise<ISendEventResponse>;
     public redactEvent(
         roomId: string,
         threadId: string | null,
@@ -3745,14 +3745,14 @@ export class MatrixClient extends EventEmitter {
         content: IContent,
         txnId?: string,
         callback?: Callback,
-    )
+    ): Promise<ISendEventResponse>;
     public sendMessage(
         roomId: string,
         threadId: string | null,
         content: IContent,
         txnId?: string,
         callback?: Callback,
-    )
+    ): Promise<ISendEventResponse>;
     public sendMessage(
         roomId: string,
         threadId: string | null | IContent,
@@ -3794,14 +3794,14 @@ export class MatrixClient extends EventEmitter {
         body: string,
         txnId?: string,
         callback?: Callback,
-    )
+    ): Promise<ISendEventResponse>;
     public sendTextMessage(
         roomId: string,
         threadId: string | null,
         body: string,
         txnId?: string,
         callback?: Callback,
-    )
+    ): Promise<ISendEventResponse>;
     public sendTextMessage(
         roomId: string,
         threadId: string | null,
@@ -3833,14 +3833,14 @@ export class MatrixClient extends EventEmitter {
         body: string,
         txnId?: string,
         callback?: Callback,
-    )
+    ): Promise<ISendEventResponse>;
     public sendNotice(
         roomId: string,
         threadId: string | null,
         body: string,
         txnId?: string,
         callback?: Callback,
-    );
+    ): Promise<ISendEventResponse>;
     public sendNotice(
         roomId: string,
         threadId: string | null,
@@ -3872,14 +3872,14 @@ export class MatrixClient extends EventEmitter {
         body: string,
         txnId?: string,
         callback?: Callback,
-    )
+    ): Promise<ISendEventResponse>;
     public sendEmoteMessage(
         roomId: string,
         threadId: string | null,
         body: string,
         txnId?: string,
         callback?: Callback,
-    );
+    ): Promise<ISendEventResponse>;
     public sendEmoteMessage(
         roomId: string,
         threadId: string | null,
@@ -3913,7 +3913,7 @@ export class MatrixClient extends EventEmitter {
         info?: IImageInfo,
         text?: string,
         callback?: Callback,
-    );
+    ): Promise<ISendEventResponse>;
     public sendImageMessage(
         roomId: string,
         threadId: string | null,
@@ -3921,7 +3921,7 @@ export class MatrixClient extends EventEmitter {
         info?: IImageInfo,
         text?: string,
         callback?: Callback,
-    );
+    ): Promise<ISendEventResponse>;
     public sendImageMessage(
         roomId: string,
         threadId: string | null,
@@ -3966,7 +3966,7 @@ export class MatrixClient extends EventEmitter {
         info?: IImageInfo,
         text?: string,
         callback?: Callback,
-    );
+    ): Promise<ISendEventResponse>;
     public sendStickerMessage(
         roomId: string,
         threadId: string | null,
@@ -3974,7 +3974,7 @@ export class MatrixClient extends EventEmitter {
         info?: IImageInfo,
         text?: string,
         callback?: Callback,
-    );
+    ): Promise<ISendEventResponse>;
     public sendStickerMessage(
         roomId: string,
         threadId: string | null,
@@ -4016,14 +4016,14 @@ export class MatrixClient extends EventEmitter {
         body: string,
         htmlBody: string,
         callback?: Callback,
-    );
+    ): Promise<ISendEventResponse>;
     public sendHtmlMessage(
         roomId: string,
         threadId: string | null,
         body: string,
         htmlBody: string,
         callback?: Callback,
-    )
+    ): Promise<ISendEventResponse>;
     public sendHtmlMessage(
         roomId: string,
         threadId: string | null,
@@ -4054,14 +4054,14 @@ export class MatrixClient extends EventEmitter {
         body: string,
         htmlBody: string,
         callback?: Callback,
-    );
+    ): Promise<ISendEventResponse>;
     public sendHtmlNotice(
         roomId: string,
         threadId: string | null,
         body: string,
         htmlBody: string,
         callback?: Callback,
-    )
+    ): Promise<ISendEventResponse>;
     public sendHtmlNotice(
         roomId: string,
         threadId: string | null,
@@ -4093,14 +4093,14 @@ export class MatrixClient extends EventEmitter {
         body: string,
         htmlBody: string,
         callback?: Callback,
-    );
+    ): Promise<ISendEventResponse>;
     public sendHtmlEmote(
         roomId: string,
         threadId: string | null,
         body: string,
         htmlBody: string,
         callback?: Callback,
-    )
+    ): Promise<ISendEventResponse>;
     public sendHtmlEmote(
         roomId: string,
         threadId: string | null,
@@ -4421,7 +4421,7 @@ export class MatrixClient extends EventEmitter {
                 errcode: "ORG.MATRIX.JSSDK_MISSING_PARAM",
             }));
         }
-        const params = {
+        const params: Record<string, string> = {
             id_server: identityServerUrl,
             medium: medium,
             address: address,
@@ -4479,10 +4479,10 @@ export class MatrixClient extends EventEmitter {
             }
         }
 
-        const populationResults = {}; // {roomId: Error}
+        const populationResults: Record<string, Error> = {}; // {roomId: Error}
         const promises = [];
 
-        const doLeave = (roomId) => {
+        const doLeave = (roomId: string) => {
             return this.leave(roomId).then(() => {
                 populationResults[roomId] = null;
             }).catch((err) => {
@@ -4641,10 +4641,12 @@ export class MatrixClient extends EventEmitter {
      * Obtain a dict of actions which should be performed for this event according
      * to the push rules for this user.  Caches the dict on the event.
      * @param {MatrixEvent} event The event to get push actions for.
+     * @param {boolean} forceRecalculate forces to recalculate actions for an event
+     * Useful when an event just got decrypted
      * @return {module:pushprocessor~PushAction} A dict of actions to perform.
      */
-    public getPushActionsForEvent(event: MatrixEvent): IActionsObject {
-        if (!event.getPushActions()) {
+    public getPushActionsForEvent(event: MatrixEvent, forceRecalculate = false): IActionsObject {
+        if (!event.getPushActions() || forceRecalculate) {
             event.setPushActions(this.pushProcessor.actionsForEvent(event));
         }
         return event.getPushActions();
@@ -5064,14 +5066,14 @@ export class MatrixClient extends EventEmitter {
             return pendingRequest;
         }
 
-        let path;
-        let params;
-        let promise;
+        let path: string;
+        let params: Record<string, string>;
+        let promise: Promise<boolean>;
 
         if (isNotifTimeline) {
             path = "/notifications";
             params = {
-                limit: ('limit' in opts) ? opts.limit : 30,
+                limit: (opts.limit ?? 30).toString(),
                 only: 'highlight',
             };
 
@@ -5123,8 +5125,8 @@ export class MatrixClient extends EventEmitter {
                 token,
                 opts.limit,
                 dir,
-                eventTimeline.getFilter());
-            promise.then((res) => {
+                eventTimeline.getFilter(),
+            ).then((res) => {
                 if (res.state) {
                     const roomState = eventTimeline.getState(dir);
                     const stateEvents = res.state.map(this.getEventMapper());
@@ -5508,7 +5510,7 @@ export class MatrixClient extends EventEmitter {
      * @return {module:http-api.MatrixError} Rejects: with an error response.
      */
     public setRoomMutePushRule(scope: string, roomId: string, mute: boolean): Promise<void> | void {
-        let deferred;
+        let promise: Promise<void>;
         let hasDontNotifyRule;
 
         // Get the existing room-kind push rule if any
@@ -5522,17 +5524,17 @@ export class MatrixClient extends EventEmitter {
         if (!mute) {
             // Remove the rule only if it is a muting rule
             if (hasDontNotifyRule) {
-                deferred = this.deletePushRule(scope, PushRuleKind.RoomSpecific, roomPushRule.rule_id);
+                promise = this.deletePushRule(scope, PushRuleKind.RoomSpecific, roomPushRule.rule_id);
             }
         } else {
             if (!roomPushRule) {
-                deferred = this.addPushRule(scope, PushRuleKind.RoomSpecific, roomId, {
+                promise = this.addPushRule(scope, PushRuleKind.RoomSpecific, roomId, {
                     actions: ["dont_notify"],
                 });
             } else if (!hasDontNotifyRule) {
                 // Remove the existing one before setting the mute push rule
                 // This is a workaround to SYN-590 (Push rule update fails)
-                deferred = utils.defer();
+                const deferred = utils.defer();
                 this.deletePushRule(scope, PushRuleKind.RoomSpecific, roomPushRule.rule_id)
                     .then(() => {
                         this.addPushRule(scope, PushRuleKind.RoomSpecific, roomId, {
@@ -5546,21 +5548,21 @@ export class MatrixClient extends EventEmitter {
                         deferred.reject(err);
                     });
 
-                deferred = deferred.promise;
+                promise = deferred.promise;
             }
         }
 
-        if (deferred) {
+        if (promise) {
             return new Promise<void>((resolve, reject) => {
                 // Update this.pushRules when the operation completes
-                deferred.then(() => {
+                promise.then(() => {
                     this.getPushRules().then((result) => {
                         this.pushRules = result;
                         resolve();
                     }).catch((err) => {
                         reject(err);
                     });
-                }).catch((err) => {
+                }).catch((err: Error) => {
                     // Update it even if the previous operation fails. This can help the
                     // app to recover when push settings has been modifed from another client
                     this.getPushRules().then((result) => {
@@ -6258,16 +6260,20 @@ export class MatrixClient extends EventEmitter {
      * @param {string} relationType the rel_type of the relations requested
      * @param {string} eventType the event type of the relations requested
      * @param {Object} opts options with optional values for the request.
-     * @param {Object} opts.from the pagination token returned from a previous request as `nextBatch` to return following relations.
      * @return {Object} an object with `events` as `MatrixEvent[]` and optionally `nextBatch` if more relations are available.
      */
     public async relations(
         roomId: string,
         eventId: string,
-        relationType: string,
-        eventType: string,
-        opts: { from: string },
-    ): Promise<{ originalEvent: MatrixEvent, events: MatrixEvent[], nextBatch?: string }> {
+        relationType: RelationType | string | null,
+        eventType: EventType | string | null,
+        opts: IRelationsRequestOpts = {},
+    ): Promise<{
+        originalEvent: MatrixEvent;
+        events: MatrixEvent[];
+        nextBatch?: string;
+        prevBatch?: string;
+    }> {
         const fetchedEventType = this.getEncryptedIfNeededEventType(roomId, eventType);
         const result = await this.fetchRelations(
             roomId,
@@ -6276,7 +6282,7 @@ export class MatrixClient extends EventEmitter {
             fetchedEventType,
             opts);
         const mapper = this.getEventMapper();
-        let originalEvent;
+        let originalEvent: MatrixEvent;
         if (result.original_event) {
             originalEvent = mapper(result.original_event);
         }
@@ -6297,6 +6303,7 @@ export class MatrixClient extends EventEmitter {
             originalEvent,
             events,
             nextBatch: result.next_batch,
+            prevBatch: result.prev_batch,
         };
     }
 
@@ -6558,7 +6565,7 @@ export class MatrixClient extends EventEmitter {
         };
 
         // merge data into loginData
-        utils.extend(loginData, data);
+        Object.assign(loginData, data);
 
         return this.http.authedRequest(
             (error, response) => {
@@ -6744,26 +6751,26 @@ export class MatrixClient extends EventEmitter {
      * Fetches relations for a given event
      * @param {string} roomId the room of the event
      * @param {string} eventId the id of the event
-     * @param {string} relationType the rel_type of the relations requested
-     * @param {string} eventType the event type of the relations requested
-     * @param {Object} opts options with optional values for the request.
-     * @param {Object} opts.from the pagination token returned from a previous request as `next_batch` to return following relations.
-     * @return {Object} the response, with chunk and next_batch.
+     * @param {string} [relationType] the rel_type of the relations requested
+     * @param {string} [eventType] the event type of the relations requested
+     * @param {Object} [opts] options with optional values for the request.
+    * @return {Object} the response, with chunk, prev_batch and, next_batch.
      */
     public async fetchRelations(
         roomId: string,
         eventId: string,
-        relationType: string,
-        eventType: string,
-        opts: { from: string },
-    ): Promise<any> { // TODO: Types
-        const queryParams: any = {};
-        if (opts.from) {
-            queryParams.from = opts.from;
-        }
-        const queryString = utils.encodeParams(queryParams);
+        relationType?: RelationType | string | null,
+        eventType?: EventType | string | null,
+        opts: IRelationsRequestOpts = {},
+    ): Promise<IRelationsResponse> {
+        const queryString = utils.encodeParams(opts as Record<string, string | number>);
+
+        let templatedUrl = "/rooms/$roomId/relations/$eventId";
+        if (relationType !== null) templatedUrl += "/$relationType";
+        if (eventType !== null) templatedUrl += "/$eventType";
+
         const path = utils.encodeUri(
-            "/rooms/$roomId/relations/$eventId/$relationType/$eventType?" + queryString, {
+            templatedUrl + "?" + queryString, {
                 $roomId: roomId,
                 $eventId: eventId,
                 $relationType: relationType,
@@ -7534,7 +7541,7 @@ export class MatrixClient extends EventEmitter {
      * @return {module:http-api.MatrixError} Rejects: with an error response.
      */
     public getPushRules(callback?: Callback): Promise<IPushRules> {
-        return this.http.authedRequest(callback, "GET", "/pushrules/").then(rules => {
+        return this.http.authedRequest(callback, "GET", "/pushrules/").then((rules: IPushRules) => {
             return PushProcessor.rewriteDefaultRules(rules);
         });
     }
@@ -8008,7 +8015,7 @@ export class MatrixClient extends EventEmitter {
         addressPairs: [string, string][],
         identityAccessToken: string,
     ): Promise<{ address: string, mxid: string }[]> {
-        const params = {
+        const params: Record<string, string | string[]> = {
             // addresses: ["email@example.org", "10005550000"],
             // algorithm: "sha256",
             // pepper: "abc123"
@@ -8022,7 +8029,7 @@ export class MatrixClient extends EventEmitter {
 
         params['pepper'] = hashes['lookup_pepper'];
 
-        const localMapping = {
+        const localMapping: Record<string, string> = {
             // hashed identifier => plain text address
             // For use in this function's return format
         };
@@ -8891,6 +8898,13 @@ export class MatrixClient extends EventEmitter {
             .forEach(event => {
                 room.addThreadedEvent(event);
             });
+    }
+
+    /**
+     * Fetches the user_id of the configured access token.
+     */
+    public async whoami(): Promise<{ user_id: string }> { // eslint-disable-line camelcase
+        return this.http.authedRequest(undefined, "GET", "/account/whoami");
     }
 }
 
