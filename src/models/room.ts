@@ -21,7 +21,7 @@ limitations under the License.
 import { EventEmitter } from "events";
 
 import { EventTimelineSet, DuplicateStrategy } from "./event-timeline-set";
-import { EventTimeline } from "./event-timeline";
+import { Direction, EventTimeline } from "./event-timeline";
 import { getHttpUriForMxc } from "../content-repo";
 import * as utils from "../utils";
 import { normalize } from "../utils";
@@ -36,6 +36,7 @@ import { GuestAccess, HistoryVisibility, JoinRule, ResizeMethod } from "../@type
 import { Filter } from "../filter";
 import { RoomState } from "./room-state";
 import { Thread, ThreadEvent } from "./thread";
+import { Method } from "../http-api";
 
 // These constants are used as sane defaults when the homeserver doesn't support
 // the m.room_versions capability. In practice, KNOWN_SAFE_ROOM_VERSION should be
@@ -109,6 +110,13 @@ export enum NotificationCountType {
     Total = "total",
 }
 
+export interface ICreateFilterOpts {
+    // Populate the filtered timeline with already loaded events in the room
+    // timeline. Useful to disable for some filters that can't be achieved by the
+    // client in an efficient manner
+    prepopulateTimeline?: boolean;
+}
+
 export class Room extends EventEmitter {
     private readonly reEmitter: ReEmitter;
     private txnToEvent: Record<string, MatrixEvent> = {}; // Pending in-flight requests { string: MatrixEvent }
@@ -135,15 +143,49 @@ export class Room extends EventEmitter {
     private membersPromise?: Promise<boolean>;
 
     // XXX: These should be read-only
+    /**
+     * The human-readable display name for this room.
+     */
     public name: string;
+    /**
+     * The un-homoglyphed name for this room.
+     */
     public normalizedName: string;
+    /**
+     * Dict of room tags; the keys are the tag name and the values
+     * are any metadata associated with the tag - e.g. { "fav" : { order: 1 } }
+     */
     public tags: Record<string, Record<string, any>> = {}; // $tagName: { $metadata: $value }
+    /**
+     * accountData Dict of per-room account_data events; the keys are the
+     * event type and the values are the events.
+     */
     public accountData: Record<string, MatrixEvent> = {}; // $eventType: $event
+    /**
+     * The room summary.
+     */
     public summary: RoomSummary = null;
+    /**
+     * A token which a data store can use to remember the state of the room.
+     */
     public readonly storageToken?: string;
     // legacy fields
+    /**
+     * The live event timeline for this room, with the oldest event at index 0.
+     * Present for backwards compatibility - prefer getLiveTimeline().getEvents()
+     */
     public timeline: MatrixEvent[];
+    /**
+     * oldState The state of the room at the time of the oldest
+     * event in the live timeline. Present for backwards compatibility -
+     * prefer getLiveTimeline().getState(EventTimeline.BACKWARDS).
+     */
     public oldState: RoomState;
+    /**
+     * currentState The state of the room at the time of the
+     * newest event in the timeline. Present for backwards compatibility -
+     * prefer getLiveTimeline().getState(EventTimeline.FORWARDS).
+     */
     public currentState: RoomState;
 
     /**
@@ -191,26 +233,6 @@ export class Room extends EventEmitter {
      * Optional. Set to true to enable client-side aggregation of event relations
      * via `EventTimelineSet#getRelationsForEvent`.
      * This feature is currently unstable and the API may change without notice.
-     *
-     * @prop {string} roomId The ID of this room.
-     * @prop {string} name The human-readable display name for this room.
-     * @prop {string} normalizedName The un-homoglyphed name for this room.
-     * @prop {Array<MatrixEvent>} timeline The live event timeline for this room,
-     * with the oldest event at index 0. Present for backwards compatibility -
-     * prefer getLiveTimeline().getEvents().
-     * @prop {object} tags Dict of room tags; the keys are the tag name and the values
-     * are any metadata associated with the tag - e.g. { "fav" : { order: 1 } }
-     * @prop {object} accountData Dict of per-room account_data events; the keys are the
-     * event type and the values are the events.
-     * @prop {RoomState} oldState The state of the room at the time of the oldest
-     * event in the live timeline. Present for backwards compatibility -
-     * prefer getLiveTimeline().getState(EventTimeline.BACKWARDS).
-     * @prop {RoomState} currentState The state of the room at the time of the
-     * newest event in the timeline. Present for backwards compatibility -
-     * prefer getLiveTimeline().getState(EventTimeline.FORWARDS).
-     * @prop {RoomSummary} summary The room summary.
-     * @prop {*} storageToken A token which a data store can use to remember
-     * the state of the room.
      */
     constructor(
         public readonly roomId: string,
@@ -660,7 +682,7 @@ export class Room extends EventEmitter {
         const path = utils.encodeUri("/rooms/$roomId/members?" + queryString,
             { $roomId: this.roomId });
         const http = this.client.http;
-        const response = await http.authedRequest(undefined, "GET", path);
+        const response = await http.authedRequest<{ chunk: IEvent[] }>(undefined, Method.Get, path);
         return response.chunk;
     }
 
@@ -778,7 +800,7 @@ export class Room extends EventEmitter {
      * timeline which would otherwise be unable to paginate forwards without this token).
      * Removing just the old live timeline whilst preserving previous ones is not supported.
      */
-    public resetLiveTimeline(backPaginationToken: string, forwardPaginationToken: string): void {
+    public resetLiveTimeline(backPaginationToken: string | null, forwardPaginationToken: string | null): void {
         for (let i = 0; i < this.timelineSets.length; i++) {
             this.timelineSets[i].resetLiveTimeline(
                 backPaginationToken, forwardPaginationToken,
@@ -1207,9 +1229,14 @@ export class Room extends EventEmitter {
     /**
      * Add a timelineSet for this room with the given filter
      * @param {Filter} filter The filter to be applied to this timelineSet
+     * @param {Object=} opts Configuration options
+     * @param {*} opts.storageToken Optional.
      * @return {EventTimelineSet} The timelineSet
      */
-    public getOrCreateFilteredTimelineSet(filter: Filter): EventTimelineSet {
+    public getOrCreateFilteredTimelineSet(
+        filter: Filter,
+        { prepopulateTimeline = true }: ICreateFilterOpts = {},
+    ): EventTimelineSet {
         if (this.filteredTimelineSets[filter.filterId]) {
             return this.filteredTimelineSets[filter.filterId];
         }
@@ -1219,29 +1246,38 @@ export class Room extends EventEmitter {
         this.filteredTimelineSets[filter.filterId] = timelineSet;
         this.timelineSets.push(timelineSet);
 
-        // populate up the new timelineSet with filtered events from our live
-        // unfiltered timeline.
-        //
-        // XXX: This is risky as our timeline
-        // may have grown huge and so take a long time to filter.
-        // see https://github.com/vector-im/vector-web/issues/2109
-
         const unfilteredLiveTimeline = this.getLiveTimeline();
+        // Not all filter are possible to replicate client-side only
+        // When that's the case we do not want to prepopulate from the live timeline
+        // as we would get incorrect results compared to what the server would send back
+        if (prepopulateTimeline) {
+            // populate up the new timelineSet with filtered events from our live
+            // unfiltered timeline.
+            //
+            // XXX: This is risky as our timeline
+            // may have grown huge and so take a long time to filter.
+            // see https://github.com/vector-im/vector-web/issues/2109
 
-        unfilteredLiveTimeline.getEvents().forEach(function(event) {
-            timelineSet.addLiveEvent(event);
-        });
+            unfilteredLiveTimeline.getEvents().forEach(function(event) {
+                timelineSet.addLiveEvent(event);
+            });
 
-        // find the earliest unfiltered timeline
-        let timeline = unfilteredLiveTimeline;
-        while (timeline.getNeighbouringTimeline(EventTimeline.BACKWARDS)) {
-            timeline = timeline.getNeighbouringTimeline(EventTimeline.BACKWARDS);
+            // find the earliest unfiltered timeline
+            let timeline = unfilteredLiveTimeline;
+            while (timeline.getNeighbouringTimeline(EventTimeline.BACKWARDS)) {
+                timeline = timeline.getNeighbouringTimeline(EventTimeline.BACKWARDS);
+            }
+
+            timelineSet.getLiveTimeline().setPaginationToken(
+                timeline.getPaginationToken(EventTimeline.BACKWARDS),
+                EventTimeline.BACKWARDS,
+            );
+        } else {
+            const livePaginationToken = unfilteredLiveTimeline.getPaginationToken(Direction.Forward);
+            timelineSet
+                .getLiveTimeline()
+                .setPaginationToken(livePaginationToken, Direction.Backward);
         }
-
-        timelineSet.getLiveTimeline().setPaginationToken(
-            timeline.getPaginationToken(EventTimeline.BACKWARDS),
-            EventTimeline.BACKWARDS,
-        );
 
         // alternatively, we could try to do something like this to try and re-paginate
         // in the filtered events from nothing, but Mark says it's an abuse of the API
@@ -1301,10 +1337,7 @@ export class Room extends EventEmitter {
                 rootEvent = new MatrixEvent(eventData);
             }
             events.unshift(rootEvent);
-            thread = new Thread(events, this, this.client);
-            this.threads.set(thread.id, thread);
-            this.reEmitter.reEmit(thread, [ThreadEvent.Update, ThreadEvent.Ready]);
-            this.emit(ThreadEvent.New, thread);
+            thread = this.createThread(events);
         }
 
         if (event.getUnsigned().transaction_id) {
@@ -1317,6 +1350,19 @@ export class Room extends EventEmitter {
         }
 
         this.emit(ThreadEvent.Update, thread);
+    }
+
+    public createThread(events: MatrixEvent[]): Thread {
+        const thread = new Thread(events, this, this.client);
+        this.threads.set(thread.id, thread);
+        this.reEmitter.reEmit(thread, [
+            ThreadEvent.Update,
+            ThreadEvent.Ready,
+            "Room.timeline",
+            "Room.timelineReset",
+        ]);
+        this.emit(ThreadEvent.New, thread);
+        return thread;
     }
 
     /**
@@ -2159,15 +2205,7 @@ export class Room extends EventEmitter {
             }
         }
 
-        let alias = this.getCanonicalAlias();
-
-        if (!alias) {
-            const aliases = this.getAltAliases();
-
-            if (aliases.length) {
-                alias = aliases[0];
-            }
-        }
+        const alias = this.getCanonicalAlias();
         if (alias) {
             return alias;
         }
