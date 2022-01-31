@@ -20,8 +20,9 @@ limitations under the License.
  */
 
 import { EventEmitter } from "events";
+import { EmoteEvent, MessageEvent, NoticeEvent, IPartialEvent } from "matrix-events-sdk";
 
-import { ISyncStateData, SyncApi } from "./sync";
+import { ISyncStateData, SyncApi, SyncState } from "./sync";
 import { EventStatus, IContent, IDecryptOptions, IEvent, MatrixEvent } from "./models/event";
 import { StubStore } from "./store/stub";
 import { createNewMatrixCall, MatrixCall } from "./webrtc/call";
@@ -86,7 +87,14 @@ import {
 } from "./crypto/keybackup";
 import { IIdentityServerProvider } from "./@types/IIdentityServerProvider";
 import { MatrixScheduler } from "./scheduler";
-import { IAuthData, ICryptoCallbacks, IMinimalEvent, IRoomEvent, IStateEvent, NotificationCountType } from "./matrix";
+import {
+    IAuthData,
+    ICryptoCallbacks,
+    IMinimalEvent,
+    IRoomEvent,
+    IStateEvent,
+    NotificationCountType,
+} from "./matrix";
 import {
     CrossSigningKey,
     IAddSecretStorageKeyOpts,
@@ -96,7 +104,6 @@ import {
     IRecoveryKey,
     ISecretStorageKeyInfo,
 } from "./crypto/api";
-import { SyncState } from "./sync";
 import { EventTimelineSet } from "./models/event-timeline-set";
 import { VerificationRequest } from "./crypto/verification/request/VerificationRequest";
 import { VerificationBase as Verification } from "./crypto/verification/Base";
@@ -804,7 +811,7 @@ export class MatrixClient extends EventEmitter {
     // TODO: This should expire: https://github.com/matrix-org/matrix-js-sdk/issues/1020
     protected serverVersionsPromise: Promise<IServerVersions>;
 
-    protected cachedCapabilities: {
+    public cachedCapabilities: {
         capabilities: ICapabilities;
         expiration: number;
     };
@@ -816,6 +823,7 @@ export class MatrixClient extends EventEmitter {
     protected exportedOlmDeviceToImport: IOlmDevice;
     protected txnCtr = 0;
     protected mediaHandler = new MediaHandler();
+    protected pendingEventEncryption = new Map<string, Promise<void>>();
 
     constructor(opts: IMatrixClientCreateOpts) {
         super();
@@ -870,7 +878,7 @@ export class MatrixClient extends EventEmitter {
 
         this.scheduler = opts.scheduler;
         if (this.scheduler) {
-            this.scheduler.setProcessFunction(async (eventToSend) => {
+            this.scheduler.setProcessFunction(async (eventToSend: MatrixEvent) => {
                 const room = this.getRoom(eventToSend.getRoomId());
                 if (eventToSend.status !== EventStatus.SENDING) {
                     this.updatePendingEventStatus(room, eventToSend, EventStatus.SENDING);
@@ -1041,9 +1049,7 @@ export class MatrixClient extends EventEmitter {
             this.syncApi.stop();
         }
 
-        if (!this.isGuest()) {
-            await this.getCapabilities(true);
-        }
+        await this.getCapabilities(true);
 
         // shallow-copy the opts dict before modifying and storing it
         this.clientOpts = Object.assign({}, opts) as IStoredClientOpts;
@@ -2576,8 +2582,10 @@ export class MatrixClient extends EventEmitter {
 
         return {
             algorithm,
+            /* eslint-disable camelcase */
             auth_data,
             recovery_key,
+            /* eslint-enable camelcase */
         };
     }
 
@@ -3399,15 +3407,18 @@ export class MatrixClient extends EventEmitter {
      * Cancel a queued or unsent event.
      *
      * @param {MatrixEvent} event   Event to cancel
-     * @throws Error if the event is not in QUEUED or NOT_SENT state
+     * @throws Error if the event is not in QUEUED, NOT_SENT or ENCRYPTING state
      */
     public cancelPendingEvent(event: MatrixEvent) {
-        if ([EventStatus.QUEUED, EventStatus.NOT_SENT].indexOf(event.status) < 0) {
+        if (![EventStatus.QUEUED, EventStatus.NOT_SENT, EventStatus.ENCRYPTING].includes(event.status)) {
             throw new Error("cannot cancel an event with status " + event.status);
         }
 
-        // first tell the scheduler to forget about it, if it's queued
-        if (this.scheduler) {
+        // if the event is currently being encrypted then
+        if (event.status === EventStatus.ENCRYPTING) {
+            this.pendingEventEncryption.delete(event.getId());
+        } else if (this.scheduler && event.status === EventStatus.QUEUED) {
+            // tell the scheduler to forget about it, if it's queued
             this.scheduler.removeEventFromQueue(event);
         }
 
@@ -3642,12 +3653,12 @@ export class MatrixClient extends EventEmitter {
         const type = localEvent.getType();
         logger.log(`sendEvent of type ${type} in ${roomId} with txnId ${txnId}`);
 
-        localEvent.setTxnId(txnId as string);
+        localEvent.setTxnId(txnId);
         localEvent.setStatus(EventStatus.SENDING);
 
         // add this event immediately to the local store as 'sending'.
         if (room) {
-            room.addPendingEvent(localEvent, txnId as string);
+            room.addPendingEvent(localEvent, txnId);
         }
 
         // addPendingEvent can change the state to NOT_SENT if it believes
@@ -3669,16 +3680,26 @@ export class MatrixClient extends EventEmitter {
      * @private
      */
     private encryptAndSendEvent(room: Room, event: MatrixEvent, callback?: Callback): Promise<ISendEventResponse> {
+        let cancelled = false;
         // Add an extra Promise.resolve() to turn synchronous exceptions into promise rejections,
         // so that we can handle synchronous and asynchronous exceptions with the
         // same code path.
         return Promise.resolve().then(() => {
             const encryptionPromise = this.encryptEventIfNeeded(event, room);
-            if (!encryptionPromise) return null;
+            if (!encryptionPromise) return null; // doesn't need encryption
 
+            this.pendingEventEncryption.set(event.getId(), encryptionPromise);
             this.updatePendingEventStatus(room, event, EventStatus.ENCRYPTING);
-            return encryptionPromise.then(() => this.updatePendingEventStatus(room, event, EventStatus.SENDING));
+            return encryptionPromise.then(() => {
+                if (!this.pendingEventEncryption.has(event.getId())) {
+                    // cancelled via MatrixClient::cancelPendingEvent
+                    cancelled = true;
+                    return;
+                }
+                this.updatePendingEventStatus(room, event, EventStatus.SENDING);
+            });
         }).then(() => {
+            if (cancelled) return {} as ISendEventResponse;
             let promise: Promise<ISendEventResponse>;
             if (this.scheduler) {
                 // if this returns a promise then the scheduler has control now and will
@@ -3922,11 +3943,51 @@ export class MatrixClient extends EventEmitter {
             callback = txnId as any as Callback; // for legacy
             txnId = undefined;
         }
+
+        // Populate all outbound events with Extensible Events metadata to ensure there's a
+        // reasonably large pool of messages to parse.
+        let eventType: string = EventType.RoomMessage;
+        let sendContent: IContent = content as IContent;
+        const makeContentExtensible = (content: IContent = {}, recurse = true): IPartialEvent<object> => {
+            let newEvent: IPartialEvent<object> = null;
+
+            if (content['msgtype'] === MsgType.Text) {
+                newEvent = MessageEvent.from(content['body'], content['formatted_body']).serialize();
+            } else if (content['msgtype'] === MsgType.Emote) {
+                newEvent = EmoteEvent.from(content['body'], content['formatted_body']).serialize();
+            } else if (content['msgtype'] === MsgType.Notice) {
+                newEvent = NoticeEvent.from(content['body'], content['formatted_body']).serialize();
+            }
+
+            if (newEvent && content['m.new_content'] && recurse) {
+                const newContent = makeContentExtensible(content['m.new_content'], false);
+                if (newContent) {
+                    newEvent.content['m.new_content'] = newContent.content;
+                }
+            }
+
+            if (newEvent) {
+                // copy over all other fields we don't know about
+                for (const [k, v] of Object.entries(content)) {
+                    if (!newEvent.content.hasOwnProperty(k)) {
+                        newEvent.content[k] = v;
+                    }
+                }
+            }
+
+            return newEvent;
+        };
+        const result = makeContentExtensible(sendContent);
+        if (result) {
+            eventType = result.type;
+            sendContent = result.content;
+        }
+
         return this.sendEvent(
             roomId,
             threadId as (string | null),
-            EventType.RoomMessage,
-            content as IContent,
+            eventType,
+            sendContent,
             txnId as string,
             callback,
         );
@@ -4994,7 +5055,7 @@ export class MatrixClient extends EventEmitter {
                     limit,
                     Direction.Backward,
                 );
-            }).then((res: IMessagesResponse) => {
+            }).then(async (res: IMessagesResponse) => {
                 const matrixEvents = res.chunk.map(this.getEventMapper());
                 if (res.state) {
                     const stateEvents = res.state.map(this.getEventMapper());
@@ -5004,7 +5065,7 @@ export class MatrixClient extends EventEmitter {
                 const [timelineEvents, threadedEvents] = this.partitionThreadedEvents(matrixEvents);
 
                 room.addEventsToTimeline(timelineEvents, true, room.getLiveTimeline());
-                this.processThreadEvents(room, threadedEvents);
+                await this.processThreadEvents(room, threadedEvents);
 
                 room.oldState.paginationToken = res.end;
                 if (res.chunk.length === 0) {
@@ -5082,7 +5143,7 @@ export class MatrixClient extends EventEmitter {
 
         // TODO: we should implement a backoff (as per scrollback()) to deal more
         // nicely with HTTP errors.
-        const promise = this.http.authedRequest<any>(undefined, Method.Get, path, params).then((res) => { // TODO types
+        const promise = this.http.authedRequest<any>(undefined, Method.Get, path, params).then(async (res) => { // TODO types
             if (!res.event) {
                 throw new Error("'event' not in '/context' result - homeserver too old?");
             }
@@ -5115,7 +5176,7 @@ export class MatrixClient extends EventEmitter {
             const [timelineEvents, threadedEvents] = this.partitionThreadedEvents(matrixEvents);
 
             timelineSet.addEventsToTimeline(timelineEvents, true, timeline, res.start);
-            this.processThreadEvents(timelineSet.room, threadedEvents);
+            await this.processThreadEvents(timelineSet.room, threadedEvents);
 
             // there is no guarantee that the event ended up in "timeline" (we
             // might have switched to a neighbouring timeline) - so check the
@@ -5230,7 +5291,7 @@ export class MatrixClient extends EventEmitter {
 
             promise = this.http.authedRequest<any>( // TODO types
                 undefined, Method.Get, path, params, undefined,
-            ).then((res) => {
+            ).then(async (res) => {
                 const token = res.next_token;
                 const matrixEvents = [];
 
@@ -5248,7 +5309,7 @@ export class MatrixClient extends EventEmitter {
 
                 const timelineSet = eventTimeline.getTimelineSet();
                 timelineSet.addEventsToTimeline(timelineEvents, backwards, eventTimeline, token);
-                this.processThreadEvents(timelineSet.room, threadedEvents);
+                await this.processThreadEvents(timelineSet.room, threadedEvents);
 
                 // if we've hit the end of the timeline, we need to stop trying to
                 // paginate. We need to keep the 'forwards' token though, to make sure
@@ -5273,7 +5334,7 @@ export class MatrixClient extends EventEmitter {
                 opts.limit,
                 dir,
                 eventTimeline.getFilter(),
-            ).then((res) => {
+            ).then(async (res) => {
                 if (res.state) {
                     const roomState = eventTimeline.getState(dir);
                     const stateEvents = res.state.map(this.getEventMapper());
@@ -5286,7 +5347,7 @@ export class MatrixClient extends EventEmitter {
 
                 eventTimeline.getTimelineSet()
                     .addEventsToTimeline(timelineEvents, backwards, eventTimeline, token);
-                this.processThreadEvents(room, threadedEvents);
+                await this.processThreadEvents(room, threadedEvents);
 
                 // if we've hit the end of the timeline, we need to stop trying to
                 // paginate. We need to keep the 'forwards' token though, to make sure
@@ -6557,13 +6618,18 @@ export class MatrixClient extends EventEmitter {
      * Check whether a username is available prior to registration. An error response
      * indicates an invalid/unavailable username.
      * @param {string} username The username to check the availability of.
-     * @return {Promise} Resolves: to `true`.
+     * @return {Promise} Resolves: to boolean of whether the username is available.
      */
-    public isUsernameAvailable(username: string): Promise<true> {
+    public isUsernameAvailable(username: string): Promise<boolean> {
         return this.http.authedRequest<{ available: true }>(
-            undefined, Method.Get, '/register/available', { username: username },
+            undefined, Method.Get, '/register/available', { username },
         ).then((response) => {
             return response.available;
+        }).catch(response => {
+            if (response.errcode === "M_USER_IN_USE") {
+                return false;
+            }
+            return Promise.reject(response);
         });
     }
 
@@ -9001,7 +9067,10 @@ export class MatrixClient extends EventEmitter {
                     const parentEvent = room?.findEventById(parentEventId) || events.find((mxEv: MatrixEvent) => {
                         return mxEv.getId() === parentEventId;
                     });
-                    shouldLiveInThreadTimeline = parentEvent?.isThreadRelation;
+                    if (parentEvent?.isThreadRelation) {
+                        shouldLiveInThreadTimeline = true;
+                        event.setThreadId(parentEvent.threadRootId);
+                    }
 
                     // Copy all the reactions and annotations to the root event
                     // to the thread timeline. They will end up living in both
@@ -9028,12 +9097,11 @@ export class MatrixClient extends EventEmitter {
     /**
      * @experimental
      */
-    public processThreadEvents(room: Room, threadedEvents: MatrixEvent[]): void {
-        threadedEvents
-            .sort((a, b) => a.getTs() - b.getTs())
-            .forEach(event => {
-                room.addThreadedEvent(event);
-            });
+    public async processThreadEvents(room: Room, threadedEvents: MatrixEvent[]): Promise<void> {
+        threadedEvents.sort((a, b) => a.getTs() - b.getTs());
+        for (const event of threadedEvents) {
+            await room.addThreadedEvent(event);
+        }
     }
 
     /**

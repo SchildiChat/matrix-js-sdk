@@ -201,6 +201,7 @@ export class SyncApi {
             "Room.accountData",
             "Room.myMembership",
             "Room.replaceEvent",
+            "Room.visibilityChange",
         ]);
         this.registerStateListeners(room);
         return room;
@@ -283,7 +284,7 @@ export class SyncApi {
                 leaveRooms = this.mapSyncResponseToRoomArray(data.rooms.leave);
             }
             const rooms = [];
-            leaveRooms.forEach((leaveObj) => {
+            leaveRooms.forEach(async (leaveObj) => {
                 const room = leaveObj.room;
                 rooms.push(room);
                 if (!leaveObj.isBrandNewRoom) {
@@ -309,7 +310,7 @@ export class SyncApi {
                     EventTimeline.BACKWARDS);
 
                 this.processRoomEvents(room, stateEvents, timelineEvents);
-                this.processThreadEvents(room, threadedEvents);
+                await this.processThreadEvents(room, threadedEvents);
 
                 room.recalculate();
                 client.store.storeRoom(room);
@@ -1306,7 +1307,7 @@ export class SyncApi {
             const [timelineEvents, threadedEvents] = this.client.partitionThreadedEvents(events);
 
             this.processRoomEvents(room, stateEvents, timelineEvents, syncEventData.fromCache);
-            this.processThreadEvents(room, threadedEvents);
+            await this.processThreadEvents(room, threadedEvents);
 
             // set summary after processing events,
             // because it will trigger a name calculation
@@ -1365,7 +1366,7 @@ export class SyncApi {
         });
 
         // Handle leaves (e.g. kicked rooms)
-        leaveRooms.forEach((leaveObj) => {
+        leaveRooms.forEach(async (leaveObj) => {
             const room = leaveObj.room;
             const stateEvents = this.mapSyncEventsFormat(leaveObj.state, room);
             const events = this.mapSyncEventsFormat(leaveObj.timeline, room);
@@ -1374,7 +1375,7 @@ export class SyncApi {
             const [timelineEvents, threadedEvents] = this.client.partitionThreadedEvents(events);
 
             this.processRoomEvents(room, stateEvents, timelineEvents);
-            this.processThreadEvents(room, threadedEvents);
+            await this.processThreadEvents(room, threadedEvents);
             room.addAccountData(accountDataEvents);
 
             room.recalculate();
@@ -1719,7 +1720,7 @@ export class SyncApi {
     /**
      * @experimental
      */
-    private processThreadEvents(room: Room, threadedEvents: MatrixEvent[]): void {
+    private processThreadEvents(room: Room, threadedEvents: MatrixEvent[]): Promise<void> {
         return this.client.processThreadEvents(room, threadedEvents);
     }
 
