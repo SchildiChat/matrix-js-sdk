@@ -111,6 +111,12 @@ interface IRequestOpts<T> {
     json?: boolean; // defaults to true
     qsStringifyOptions?: CoreOptions["qsStringifyOptions"];
     bodyParser?(body: string): T;
+
+    // Set to true to prevent the request function from emitting
+    // a Session.logged_out event. This is intended for use on
+    // endpoints where M_UNKNOWN_TOKEN is a valid/notable error
+    // response, such as with token refreshes.
+    inhibitLogoutEmit?: boolean;
 }
 
 export interface IUpload {
@@ -437,10 +443,20 @@ export class MatrixHttpApi {
                 queryParams.filename = fileName;
             }
 
+            const headers: Record<string, string> = { "Content-Type": contentType };
+
+            // authedRequest uses `request` which is no longer maintained.
+            // `request` has a bug where if the body is zero bytes then you get an error: `Argument error, options.body`.
+            // See https://github.com/request/request/issues/920
+            // if body looks like a byte array and empty then set the Content-Length explicitly as a workaround:
+            if ((body as unknown as ArrayLike<number>).length === 0) {
+                headers["Content-Length"] = "0";
+            }
+
             promise = this.authedRequest(
                 opts.callback, Method.Post, "/upload", queryParams, body, {
                     prefix: "/_matrix/media/r0",
-                    headers: { "Content-Type": contentType },
+                    headers,
                     json: false,
                     bodyParser,
                 },
@@ -586,7 +602,7 @@ export class MatrixHttpApi {
         const requestPromise = this.request<T, O>(callback, method, path, queryParams, data, requestOpts);
 
         requestPromise.catch((err: MatrixError) => {
-            if (err.errcode == 'M_UNKNOWN_TOKEN') {
+            if (err.errcode == 'M_UNKNOWN_TOKEN' && !requestOpts?.inhibitLogoutEmit) {
                 this.eventEmitter.emit("Session.logged_out", err);
             } else if (err.errcode == 'M_CONSENT_NOT_GIVEN') {
                 this.eventEmitter.emit(
