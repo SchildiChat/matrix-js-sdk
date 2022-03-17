@@ -19,15 +19,22 @@ limitations under the License.
  * @module client
  */
 
-import { EventEmitter } from "events";
 import { EmoteEvent, IPartialEvent, MessageEvent, NoticeEvent } from "matrix-events-sdk";
 
 import { ISyncStateData, SyncApi, SyncState } from "./sync";
-import { EventStatus, IContent, IDecryptOptions, IEvent, MatrixEvent } from "./models/event";
+import {
+    EventStatus,
+    IContent,
+    IDecryptOptions,
+    IEvent,
+    MatrixEvent,
+    MatrixEventEvent,
+    MatrixEventHandlerMap,
+} from "./models/event";
 import { StubStore } from "./store/stub";
-import { createNewMatrixCall, MatrixCall } from "./webrtc/call";
+import { CallEvent, CallEventHandlerMap, createNewMatrixCall, MatrixCall } from "./webrtc/call";
 import { Filter, IFilterDefinition } from "./filter";
-import { CallEventHandler } from './webrtc/callEventHandler';
+import { CallEventHandlerEvent, CallEventHandler, CallEventHandlerEventHandlerMap } from './webrtc/callEventHandler';
 import * as utils from './utils';
 import { sleep } from './utils';
 import { Group } from "./models/group";
@@ -37,12 +44,12 @@ import { AutoDiscovery, AutoDiscoveryAction } from "./autodiscovery";
 import * as olmlib from "./crypto/olmlib";
 import { decodeBase64, encodeBase64 } from "./crypto/olmlib";
 import { IExportedDevice as IOlmDevice } from "./crypto/OlmDevice";
-import { ReEmitter } from './ReEmitter';
+import { TypedReEmitter } from './ReEmitter';
 import { IRoomEncryption, RoomList } from './crypto/RoomList';
 import { logger } from './logger';
 import { SERVICE_TYPES } from './service-types';
 import {
-    FileType,
+    FileType, HttpApiEvent, HttpApiEventHandlerMap,
     IHttpOpts,
     IUpload,
     MatrixError,
@@ -58,6 +65,8 @@ import {
 } from "./http-api";
 import {
     Crypto,
+    CryptoEvent,
+    CryptoEventHandlerMap,
     fixBackupKey,
     IBootstrapCrossSigningOpts,
     ICheckOwnCrossSigningTrustOpts,
@@ -68,7 +77,7 @@ import {
 import { DeviceInfo, IDevice } from "./crypto/deviceinfo";
 import { decodeRecoveryKey } from './crypto/recoverykey';
 import { keyFromAuthData } from './crypto/key_passphrase';
-import { User } from "./models/user";
+import { User, UserEvent, UserEventHandlerMap } from "./models/user";
 import { getHttpUriForMxc } from "./content-repo";
 import { SearchResult } from "./models/search-result";
 import {
@@ -88,7 +97,20 @@ import {
 } from "./crypto/keybackup";
 import { IIdentityServerProvider } from "./@types/IIdentityServerProvider";
 import { MatrixScheduler } from "./scheduler";
-import { IAuthData, ICryptoCallbacks, IMinimalEvent, IRoomEvent, IStateEvent, NotificationCountType } from "./matrix";
+import {
+    IAuthData,
+    ICryptoCallbacks,
+    IMinimalEvent,
+    IRoomEvent,
+    IStateEvent,
+    NotificationCountType,
+    RoomEvent,
+    RoomEventHandlerMap,
+    RoomMemberEvent,
+    RoomMemberEventHandlerMap,
+    RoomStateEvent,
+    RoomStateEventHandlerMap,
+} from "./matrix";
 import {
     CrossSigningKey,
     IAddSecretStorageKeyOpts,
@@ -149,12 +171,13 @@ import {
     SearchOrderBy,
 } from "./@types/search";
 import { ISynapseAdminDeactivateResponse, ISynapseAdminWhoisResponse } from "./@types/synapse";
-import { IHierarchyRoom, ISpaceSummaryEvent, ISpaceSummaryRoom } from "./@types/spaces";
+import { IHierarchyRoom } from "./@types/spaces";
 import { IPusher, IPusherRequest, IPushRules, PushRuleAction, PushRuleKind, RuleId } from "./@types/PushRules";
 import { IThreepid } from "./@types/threepids";
 import { CryptoStore } from "./crypto/store/base";
 import { MediaHandler } from "./webrtc/mediaHandler";
 import { IRefreshTokenResponse } from "./@types/auth";
+import { TypedEventEmitter } from "./models/typed-event-emitter";
 
 export type Store = IStore;
 export type SessionStore = WebStorageSessionStore;
@@ -453,7 +476,7 @@ export interface ISignedKey {
 }
 
 export type KeySignatures = Record<string, Record<string, ICrossSigningKey | ISignedKey>>;
-interface IUploadKeySignaturesResponse {
+export interface IUploadKeySignaturesResponse {
     failures: Record<string, Record<string, {
         errcode: string;
         error: string;
@@ -487,7 +510,7 @@ interface ITurnServer {
 }
 
 interface IServerVersions {
-    versions: string;
+    versions: string[];
     unstable_features: Record<string, boolean>;
 }
 
@@ -747,15 +770,109 @@ interface ITimestampToEventResponse {
 // Probably not the most graceful solution but does a good enough job for now
 const EVENT_ID_PREFIX = "$";
 
+export enum ClientEvent {
+    Sync = "sync",
+    Event = "event",
+    ToDeviceEvent = "toDeviceEvent",
+    AccountData = "accountData",
+    Room = "Room",
+    DeleteRoom = "deleteRoom",
+    SyncUnexpectedError = "sync.unexpectedError",
+    ClientWellKnown = "WellKnown.client",
+    /* @deprecated */
+    Group = "Group",
+    // The following enum members are both deprecated and in the wrong place, Groups haven't been TSified
+    GroupProfile = "Group.profile",
+    GroupMyMembership = "Group.myMembership",
+}
+
+type RoomEvents = RoomEvent.Name
+    | RoomEvent.Redaction
+    | RoomEvent.RedactionCancelled
+    | RoomEvent.Receipt
+    | RoomEvent.Tags
+    | RoomEvent.LocalEchoUpdated
+    | RoomEvent.AccountData
+    | RoomEvent.MyMembership
+    | RoomEvent.Timeline
+    | RoomEvent.TimelineReset;
+
+type RoomStateEvents = RoomStateEvent.Events
+    | RoomStateEvent.Members
+    | RoomStateEvent.NewMember
+    | RoomStateEvent.Update
+    ;
+
+type CryptoEvents = CryptoEvent.KeySignatureUploadFailure
+    | CryptoEvent.KeyBackupStatus
+    | CryptoEvent.KeyBackupFailed
+    | CryptoEvent.KeyBackupSessionsRemaining
+    | CryptoEvent.RoomKeyRequest
+    | CryptoEvent.RoomKeyRequestCancellation
+    | CryptoEvent.VerificationRequest
+    | CryptoEvent.DeviceVerificationChanged
+    | CryptoEvent.UserTrustStatusChanged
+    | CryptoEvent.KeysChanged
+    | CryptoEvent.Warning
+    | CryptoEvent.DevicesUpdated
+    | CryptoEvent.WillUpdateDevices;
+
+type MatrixEventEvents = MatrixEventEvent.Decrypted | MatrixEventEvent.Replaced | MatrixEventEvent.VisibilityChange;
+
+type RoomMemberEvents = RoomMemberEvent.Name
+    | RoomMemberEvent.Typing
+    | RoomMemberEvent.PowerLevel
+    | RoomMemberEvent.Membership;
+
+type UserEvents = UserEvent.AvatarUrl
+    | UserEvent.DisplayName
+    | UserEvent.Presence
+    | UserEvent.CurrentlyActive
+    | UserEvent.LastPresenceTs;
+
+type EmittedEvents = ClientEvent
+    | RoomEvents
+    | RoomStateEvents
+    | CryptoEvents
+    | MatrixEventEvents
+    | RoomMemberEvents
+    | UserEvents
+    | CallEvent // re-emitted by call.ts using Object.values
+    | CallEventHandlerEvent.Incoming
+    | HttpApiEvent.SessionLoggedOut
+    | HttpApiEvent.NoConsent;
+
+export type ClientEventHandlerMap = {
+    [ClientEvent.Sync]: (state: SyncState, lastState?: SyncState, data?: ISyncStateData) => void;
+    [ClientEvent.Event]: (event: MatrixEvent) => void;
+    [ClientEvent.ToDeviceEvent]: (event: MatrixEvent) => void;
+    [ClientEvent.AccountData]: (event: MatrixEvent, lastEvent?: MatrixEvent) => void;
+    [ClientEvent.Room]: (room: Room) => void;
+    [ClientEvent.DeleteRoom]: (roomId: string) => void;
+    [ClientEvent.SyncUnexpectedError]: (error: Error) => void;
+    [ClientEvent.ClientWellKnown]: (data: IClientWellKnown) => void;
+    [ClientEvent.Group]: (group: Group) => void;
+    [ClientEvent.GroupProfile]: (group: Group) => void;
+    [ClientEvent.GroupMyMembership]: (group: Group) => void;
+} & RoomEventHandlerMap
+    & RoomStateEventHandlerMap
+    & CryptoEventHandlerMap
+    & MatrixEventHandlerMap
+    & RoomMemberEventHandlerMap
+    & UserEventHandlerMap
+    & CallEventHandlerEventHandlerMap
+    & CallEventHandlerMap
+    & HttpApiEventHandlerMap;
+
 /**
  * Represents a Matrix Client. Only directly construct this if you want to use
  * custom modules. Normally, {@link createClient} should be used
  * as it specifies 'sensible' defaults for these modules.
  */
-export class MatrixClient extends EventEmitter {
+export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHandlerMap> {
     public static readonly RESTORE_BACKUP_ERROR_BAD_KEY = 'RESTORE_BACKUP_ERROR_BAD_KEY';
 
-    public reEmitter = new ReEmitter(this);
+    public reEmitter = new TypedReEmitter<EmittedEvents, ClientEventHandlerMap>(this);
     public olmVersion: [number, number, number] = null; // populated after initCrypto
     public usingExternalCrypto = false;
     public store: Store;
@@ -817,7 +934,7 @@ export class MatrixClient extends EventEmitter {
     protected checkTurnServersIntervalID: number;
     protected exportedOlmDeviceToImport: IOlmDevice;
     protected txnCtr = 0;
-    protected mediaHandler = new MediaHandler();
+    protected mediaHandler = new MediaHandler(this);
     protected pendingEventEncryption = new Map<string, Promise<void>>();
 
     constructor(opts: IMatrixClientCreateOpts) {
@@ -836,7 +953,7 @@ export class MatrixClient extends EventEmitter {
         const userId = opts.userId || null;
         this.credentials = { userId };
 
-        this.http = new MatrixHttpApi(this, {
+        this.http = new MatrixHttpApi(this as ConstructorParameters<typeof MatrixHttpApi>[0], {
             baseUrl: opts.baseUrl,
             idBaseUrl: opts.idBaseUrl,
             accessToken: opts.accessToken,
@@ -897,7 +1014,7 @@ export class MatrixClient extends EventEmitter {
             // Start listening for calls after the initial sync is done
             // We do not need to backfill the call event buffer
             // with encrypted events that might never get decrypted
-            this.on("sync", this.startCallEventHandler);
+            this.on(ClientEvent.Sync, this.startCallEventHandler);
         }
 
         this.timelineSupport = Boolean(opts.timelineSupport);
@@ -922,7 +1039,7 @@ export class MatrixClient extends EventEmitter {
         // actions for themselves, so we have to kinda help them out when they are encrypted.
         // We do this so that push rules are correctly executed on events in their decrypted
         // state, such as highlights when the user's name is mentioned.
-        this.on("Event.decrypted", (event) => {
+        this.on(MatrixEventEvent.Decrypted, (event) => {
             const oldActions = event.getPushActions();
             const actions = this.getPushActionsForEvent(event, true);
 
@@ -957,7 +1074,7 @@ export class MatrixClient extends EventEmitter {
         // Like above, we have to listen for read receipts from ourselves in order to
         // correctly handle notification counts on encrypted rooms.
         // This fixes https://github.com/vector-im/element-web/issues/9421
-        this.on("Room.receipt", (event, room) => {
+        this.on(RoomEvent.Receipt, (event, room) => {
             if (room && this.isRoomEncrypted(room.roomId)) {
                 // Figure out if we've read something or if it's just informational
                 const content = event.getContent();
@@ -992,7 +1109,7 @@ export class MatrixClient extends EventEmitter {
 
                 // Note: we don't need to handle 'total' notifications because the counts
                 // will come from the server.
-                room.setUnreadNotificationCount("highlight", highlightCount);
+                room.setUnreadNotificationCount(NotificationCountType.Highlight, highlightCount);
             }
         });
     }
@@ -1557,16 +1674,16 @@ export class MatrixClient extends EventEmitter {
         );
 
         this.reEmitter.reEmit(crypto, [
-            "crypto.keyBackupFailed",
-            "crypto.keyBackupSessionsRemaining",
-            "crypto.roomKeyRequest",
-            "crypto.roomKeyRequestCancellation",
-            "crypto.warning",
-            "crypto.devicesUpdated",
-            "crypto.willUpdateDevices",
-            "deviceVerificationChanged",
-            "userTrustStatusChanged",
-            "crossSigning.keysChanged",
+            CryptoEvent.KeyBackupFailed,
+            CryptoEvent.KeyBackupSessionsRemaining,
+            CryptoEvent.RoomKeyRequest,
+            CryptoEvent.RoomKeyRequestCancellation,
+            CryptoEvent.Warning,
+            CryptoEvent.DevicesUpdated,
+            CryptoEvent.WillUpdateDevices,
+            CryptoEvent.DeviceVerificationChanged,
+            CryptoEvent.UserTrustStatusChanged,
+            CryptoEvent.KeysChanged,
         ]);
 
         logger.log("Crypto: initialising crypto object...");
@@ -1578,9 +1695,8 @@ export class MatrixClient extends EventEmitter {
 
         this.olmVersion = Crypto.getOlmVersion();
 
-        // if crypto initialisation was successful, tell it to attach its event
-        // handlers.
-        crypto.registerEventHandlers(this);
+        // if crypto initialisation was successful, tell it to attach its event handlers.
+        crypto.registerEventHandlers(this as Parameters<Crypto["registerEventHandlers"]>[0]);
         this.crypto = crypto;
     }
 
@@ -1820,7 +1936,7 @@ export class MatrixClient extends EventEmitter {
      * @returns {Verification} a verification object
      * @deprecated Use `requestVerification` instead.
      */
-    public beginKeyVerification(method: string, userId: string, deviceId: string): Verification {
+    public beginKeyVerification(method: string, userId: string, deviceId: string): Verification<any, any> {
         if (!this.crypto) {
             throw new Error("End-to-end encryption disabled");
         }
@@ -3154,9 +3270,9 @@ export class MatrixClient extends EventEmitter {
      * has been emitted. Note in particular that other events, eg. RoomState.members
      * will be emitted for a room before this function will return the given room.
      * @param {string} roomId The room ID
-     * @return {Room} The Room or null if it doesn't exist or there is no data store.
+     * @return {Room|null} The Room or null if it doesn't exist or there is no data store.
      */
-    public getRoom(roomId: string): Room {
+    public getRoom(roomId: string): Room | null {
         return this.store.getRoom(roomId);
     }
 
@@ -3602,7 +3718,7 @@ export class MatrixClient extends EventEmitter {
                 content["m.relates_to"]["m.in_reply_to"] = {
                     "event_id": thread.lastReply((ev: MatrixEvent) => {
                         return ev.isThreadRelation && !ev.status;
-                    }),
+                    })?.getId(),
                 };
             }
         }
@@ -3658,9 +3774,9 @@ export class MatrixClient extends EventEmitter {
         // then listen for the remote echo of that event so that by the time
         // this event does get sent, we have the correct event_id
         const targetId = localEvent.getAssociatedId();
-        if (targetId && targetId.startsWith("~")) {
+        if (targetId?.startsWith("~")) {
             const target = room.getPendingEvents().find(e => e.getId() === targetId);
-            target.once("Event.localEventIdReplaced", () => {
+            target.once(MatrixEventEvent.LocalEventIdReplaced, () => {
                 localEvent.updateAssociatedId(target.getId());
             });
         }
@@ -4758,7 +4874,7 @@ export class MatrixClient extends EventEmitter {
         }
         return promise.then((response) => {
             this.store.removeRoom(roomId);
-            this.emit("deleteRoom", roomId);
+            this.emit(ClientEvent.DeleteRoom, roomId);
             return response;
         });
     }
@@ -4911,7 +5027,7 @@ export class MatrixClient extends EventEmitter {
         const user = this.getUser(this.getUserId());
         if (user) {
             user.displayName = name;
-            user.emit("User.displayName", user.events.presence, user);
+            user.emit(UserEvent.DisplayName, user.events.presence, user);
         }
         return prom;
     }
@@ -4928,7 +5044,7 @@ export class MatrixClient extends EventEmitter {
         const user = this.getUser(this.getUserId());
         if (user) {
             user.avatarUrl = url;
-            user.emit("User.avatarUrl", user.events.presence, user);
+            user.emit(UserEvent.AvatarUrl, user.events.presence, user);
         }
         return prom;
     }
@@ -5081,7 +5197,7 @@ export class MatrixClient extends EventEmitter {
                 const [timelineEvents, threadedEvents] = this.partitionThreadedEvents(matrixEvents);
 
                 room.addEventsToTimeline(timelineEvents, true, room.getLiveTimeline());
-                await this.processThreadEvents(room, threadedEvents);
+                await this.processThreadEvents(room, threadedEvents, true);
 
                 room.oldState.paginationToken = res.end;
                 if (res.chunk.length === 0) {
@@ -5192,7 +5308,7 @@ export class MatrixClient extends EventEmitter {
             const [timelineEvents, threadedEvents] = this.partitionThreadedEvents(matrixEvents);
 
             timelineSet.addEventsToTimeline(timelineEvents, true, timeline, res.start);
-            await this.processThreadEvents(timelineSet.room, threadedEvents);
+            await this.processThreadEvents(timelineSet.room, threadedEvents, true);
 
             // there is no guarantee that the event ended up in "timeline" (we
             // might have switched to a neighbouring timeline) - so check the
@@ -5325,7 +5441,7 @@ export class MatrixClient extends EventEmitter {
 
                 const timelineSet = eventTimeline.getTimelineSet();
                 timelineSet.addEventsToTimeline(timelineEvents, backwards, eventTimeline, token);
-                await this.processThreadEvents(timelineSet.room, threadedEvents);
+                await this.processThreadEvents(timelineSet.room, threadedEvents, backwards);
 
                 // if we've hit the end of the timeline, we need to stop trying to
                 // paginate. We need to keep the 'forwards' token though, to make sure
@@ -5363,7 +5479,7 @@ export class MatrixClient extends EventEmitter {
 
                 eventTimeline.getTimelineSet()
                     .addEventsToTimeline(timelineEvents, backwards, eventTimeline, token);
-                await this.processThreadEvents(room, threadedEvents);
+                await this.processThreadEvents(room, threadedEvents, backwards);
 
                 // if we've hit the end of the timeline, we need to stop trying to
                 // paginate. We need to keep the 'forwards' token though, to make sure
@@ -6098,7 +6214,7 @@ export class MatrixClient extends EventEmitter {
     private startCallEventHandler = (): void => {
         if (this.isInitialSyncComplete()) {
             this.callEventHandler.start();
-            this.off("sync", this.startCallEventHandler);
+            this.off(ClientEvent.Sync, this.startCallEventHandler);
         }
     };
 
@@ -6246,7 +6362,7 @@ export class MatrixClient extends EventEmitter {
         // it absorbs errors and returns `{}`.
         this.clientWellKnownPromise = AutoDiscovery.getRawClientConfig(this.getDomain());
         this.clientWellKnown = await this.clientWellKnownPromise;
-        this.emit("WellKnown.client", this.clientWellKnown);
+        this.emit(ClientEvent.ClientWellKnown, this.clientWellKnown);
     }
 
     public getClientWellKnown(): IClientWellKnown {
@@ -6484,8 +6600,8 @@ export class MatrixClient extends EventEmitter {
     public async relations(
         roomId: string,
         eventId: string,
-        relationType: RelationType | string | null,
-        eventType: EventType | string | null,
+        relationType?: RelationType | string | null,
+        eventType?: EventType | string | null,
         opts: IRelationsRequestOpts = {},
     ): Promise<{
         originalEvent: MatrixEvent;
@@ -6508,12 +6624,10 @@ export class MatrixClient extends EventEmitter {
         let events = result.chunk.map(mapper);
         if (fetchedEventType === EventType.RoomMessageEncrypted) {
             const allEvents = originalEvent ? events.concat(originalEvent) : events;
-            await Promise.all(allEvents.map(e => {
-                if (e.isEncrypted()) {
-                    return new Promise(resolve => e.once("Event.decrypted", resolve));
-                }
-            }));
-            events = events.filter(e => e.getType() === eventType);
+            await Promise.all(allEvents.map(e => this.decryptEventIfNeeded(e)));
+            if (eventType !== null) {
+                events = events.filter(e => e.getType() === eventType);
+            }
         }
         if (originalEvent && relationType === RelationType.Replace) {
             events = events.filter(e => e.getSender() === originalEvent.getSender());
@@ -7034,8 +7148,16 @@ export class MatrixClient extends EventEmitter {
         const queryString = utils.encodeParams(opts as Record<string, string | number>);
 
         let templatedUrl = "/rooms/$roomId/relations/$eventId";
-        if (relationType !== null) templatedUrl += "/$relationType";
-        if (eventType !== null) templatedUrl += "/$eventType";
+        if (relationType !== null) {
+            templatedUrl += "/$relationType";
+            if (eventType !== null) {
+                templatedUrl += "/$eventType";
+            }
+        } else if (eventType !== null) {
+            logger.warn(`eventType: ${eventType} ignored when fetching
+            relations as relationType is null`);
+            eventType = null;
+        }
 
         const path = utils.encodeUri(
             templatedUrl + "?" + queryString, {
@@ -8574,40 +8696,6 @@ export class MatrixClient extends EventEmitter {
     }
 
     /**
-     * Fetches or paginates a summary of a space as defined by an initial version of MSC2946
-     * @param {string} roomId The ID of the space-room to use as the root of the summary.
-     * @param {number?} maxRoomsPerSpace The maximum number of rooms to return per subspace.
-     * @param {boolean?} suggestedOnly Whether to only return rooms with suggested=true.
-     * @param {boolean?} autoJoinOnly Whether to only return rooms with auto_join=true.
-     * @param {number?} limit The maximum number of rooms to return in total.
-     * @param {string?} batch The opaque token to paginate a previous summary request.
-     * @returns {Promise} the response, with next_token, rooms fields.
-     * @deprecated in favour of `getRoomHierarchy` due to the MSC changing paths.
-     */
-    public getSpaceSummary(
-        roomId: string,
-        maxRoomsPerSpace?: number,
-        suggestedOnly?: boolean,
-        autoJoinOnly?: boolean,
-        limit?: number,
-        batch?: string,
-    ): Promise<{rooms: ISpaceSummaryRoom[], events: ISpaceSummaryEvent[]}> {
-        const path = utils.encodeUri("/rooms/$roomId/spaces", {
-            $roomId: roomId,
-        });
-
-        return this.http.authedRequest(undefined, Method.Post, path, null, {
-            max_rooms_per_space: maxRoomsPerSpace,
-            suggested_only: suggestedOnly,
-            auto_join_only: autoJoinOnly,
-            limit,
-            batch,
-        }, {
-            prefix: "/_matrix/client/unstable/org.matrix.msc2946",
-        });
-    }
-
-    /**
      * Fetches or paginates a room hierarchy as defined by MSC2946.
      * Falls back gracefully to sourcing its data from `getSpaceSummary` if this API is not yet supported by the server.
      * @param {string} roomId The ID of the space-room to use as the root of the summary.
@@ -8630,37 +8718,19 @@ export class MatrixClient extends EventEmitter {
 
         const queryParams: Record<string, string | string[]> = {
             suggested_only: String(suggestedOnly),
+            max_depth: maxDepth?.toString(),
+            from: fromToken,
+            limit: limit?.toString(),
         };
 
-        if (limit !== undefined) {
-            queryParams["limit"] = limit.toString();
-        }
-        if (maxDepth !== undefined) {
-            queryParams["max_depth"] = maxDepth.toString();
-        }
-        if (fromToken !== undefined) {
-            queryParams["from"] = fromToken;
-        }
-
         return this.http.authedRequest<IRoomHierarchy>(undefined, Method.Get, path, queryParams, undefined, {
-            prefix: "/_matrix/client/unstable/org.matrix.msc2946",
+            prefix: PREFIX_V1,
         }).catch(e => {
             if (e.errcode === "M_UNRECOGNIZED") {
-                // fall back to the older space summary API as it exposes the same data just in a different shape.
-                return this.getSpaceSummary(roomId, undefined, suggestedOnly, undefined, limit)
-                    .then(({ rooms, events }) => {
-                        // Translate response from `/spaces` to that we expect in this API.
-                        const roomMap = new Map(rooms.map(r => {
-                            return [r.room_id, <IHierarchyRoom>{ ...r, children_state: [] }];
-                        }));
-                        events.forEach(e => {
-                            roomMap.get(e.room_id)?.children_state.push(e);
-                        });
-
-                        return {
-                            rooms: Array.from(roomMap.values()),
-                        };
-                    });
+                // fall back to the prefixed hierarchy API.
+                return this.http.authedRequest<IRoomHierarchy>(undefined, Method.Get, path, queryParams, undefined, {
+                    prefix: "/_matrix/client/unstable/org.matrix.msc2946",
+                });
             }
 
             throw e;
@@ -9136,6 +9206,14 @@ export class MatrixClient extends EventEmitter {
         shouldLiveInThread: boolean;
         threadId?: string;
     } {
+        if (event.isThreadRoot) {
+            return {
+                shouldLiveInRoom: true,
+                shouldLiveInThread: true,
+                threadId: event.getId(),
+            };
+        }
+
         // A thread relation is always only shown in a thread
         if (event.isThreadRelation) {
             return {
@@ -9216,10 +9294,13 @@ export class MatrixClient extends EventEmitter {
     /**
      * @experimental
      */
-    public async processThreadEvents(room: Room, threadedEvents: MatrixEvent[]): Promise<void> {
-        threadedEvents.sort((a, b) => a.getTs() - b.getTs());
+    public async processThreadEvents(
+        room: Room,
+        threadedEvents: MatrixEvent[],
+        toStartOfTimeline: boolean,
+    ): Promise<void> {
         for (const event of threadedEvents) {
-            await room.addThreadedEvent(event);
+            await room.addThreadedEvent(event, toStartOfTimeline);
         }
     }
 
