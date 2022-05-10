@@ -1026,7 +1026,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
             const decodedBackupKey = new Uint8Array(olmlib.decodeBase64(
                 fixedBackupKey || sessionBackupKey,
             ));
-            await builder.addSessionBackupPrivateKeyToCache(decodedBackupKey);
+            builder.addSessionBackupPrivateKeyToCache(decodedBackupKey);
         } else if (this.backupManager.getKeyBackupEnabled()) {
             // key backup is enabled but we don't have a session backup key in SSSS: see if we have one in
             // the cache or the user can provide one, and if so, write it to SSSS
@@ -1421,6 +1421,25 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
         } else {
             return new DeviceTrustLevel(false, false, trustedLocally, false);
         }
+    }
+
+    /**
+     * Check whether one of our own devices is cross-signed by our
+     * user's stored keys, regardless of whether we trust those keys yet.
+     *
+     * @param {string} deviceId The ID of the device to check
+     *
+     * @returns {boolean} true if the device is cross-signed
+     */
+    public checkIfOwnDeviceCrossSigned(deviceId: string): boolean {
+        const device = this.deviceList.getStoredDevice(this.userId, deviceId);
+        const userCrossSigning = this.deviceList.getStoredCrossSigningForUser(this.userId);
+        return userCrossSigning.checkDeviceTrust(
+            userCrossSigning,
+            device,
+            false,
+            true,
+        ).isCrossSigningVerified();
     }
 
     /*

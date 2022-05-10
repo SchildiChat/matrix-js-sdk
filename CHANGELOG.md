@@ -1,3 +1,17 @@
+Changes in [17.2.0](https://github.com/matrix-org/matrix-js-sdk/releases/tag/v17.2.0) (2022-05-10)
+==================================================================================================
+
+## ✨ Features
+ * Live location sharing: handle encrypted messages in processBeaconEvents ([\#2327](https://github.com/matrix-org/matrix-js-sdk/pull/2327)).
+
+## 🐛 Bug Fixes
+ * Fix race conditions around threads ([\#2331](https://github.com/matrix-org/matrix-js-sdk/pull/2331)). Fixes vector-im/element-web#21627.
+ * Ignore m.replace relations on state events, they're invalid ([\#2306](https://github.com/matrix-org/matrix-js-sdk/pull/2306)). Fixes vector-im/element-web#21851.
+ * fix example in readme ([\#2315](https://github.com/matrix-org/matrix-js-sdk/pull/2315)).
+ * Don't decrement the length count of a thread when root redacted ([\#2314](https://github.com/matrix-org/matrix-js-sdk/pull/2314)).
+ * Prevent attempt to create thread with id "undefined" ([\#2308](https://github.com/matrix-org/matrix-js-sdk/pull/2308)).
+ * Update threads handling for replies-to-thread-responses as per MSC update ([\#2305](https://github.com/matrix-org/matrix-js-sdk/pull/2305)). Fixes vector-im/element-web#19678.
+
 Changes in [17.1.0](https://github.com/matrix-org/matrix-js-sdk/releases/tag/v17.1.0) (2022-04-26)
 ==================================================================================================
 
@@ -684,7 +698,7 @@ Changes in [11.0.0-rc.1](https://github.com/matrix-org/matrix-js-sdk/releases/ta
 BREAKING CHANGES
 ---
 
- * `MatrixCall` and related APIs have been redesigned to support multiple streams 
+ * `MatrixCall` and related APIs have been redesigned to support multiple streams
    (see [\#1660](https://github.com/matrix-org/matrix-js-sdk/pull/1660) for more details)
 
 All changes
@@ -1357,7 +1371,7 @@ BREAKING CHANGES
 ---
 
 * `RoomState` events changed to use a Map instead of an object, which changes the collection APIs available to access them.
- 
+
 All Changes
 ---
 

@@ -1303,8 +1303,7 @@ export class MatrixEvent extends TypedEventEmitter<EmittedEvents, MatrixEventHan
     public isRelation(relType: string = undefined): boolean {
         // Relation info is lifted out of the encrypted content when sent to
         // encrypted rooms, so we have to check `getWireContent` for this.
-        const content = this.getWireContent();
-        const relation = content && content["m.relates_to"];
+        const relation = this.getWireContent()?.["m.relates_to"];
         return relation && relation.rel_type && relation.event_id &&
             ((relType && relation.rel_type === relType) || !relType);
     }
@@ -1334,6 +1333,10 @@ export class MatrixEvent extends TypedEventEmitter<EmittedEvents, MatrixEventHan
         // as with local redaction, the replacing event might get
         // cancelled, which should be reflected on the target event.
         if (this.isRedacted() && newEvent) {
+            return;
+        }
+        // don't allow state events to be replaced using this mechanism as per MSC2676
+        if (this.isState()) {
             return;
         }
         if (this._replacingEvent !== newEvent) {

@@ -811,9 +811,7 @@ describe("MatrixClient", function() {
                     }
                 },
             },
-            threads: {
-                get: jest.fn(),
-            },
+            getThread: jest.fn(),
             addPendingEvent: jest.fn(),
             updatePendingEvent: jest.fn(),
             reEmitter: {
@@ -1047,7 +1045,7 @@ describe("MatrixClient", function() {
                 expect(roomStateProcessSpy).not.toHaveBeenCalled();
             });
 
-            it('calls room states processBeaconEvents with m.beacon events', () => {
+            it('calls room states processBeaconEvents with events', () => {
                 const room = new Room(roomId, client, userId);
                 const roomStateProcessSpy = jest.spyOn(room.currentState, 'processBeaconEvents');
 
@@ -1055,7 +1053,7 @@ describe("MatrixClient", function() {
                 const beaconEvent = makeBeaconEvent(userId);
 
                 client.processBeaconEvents(room, [messageEvent, beaconEvent]);
-                expect(roomStateProcessSpy).toHaveBeenCalledWith([beaconEvent]);
+                expect(roomStateProcessSpy).toHaveBeenCalledWith([messageEvent, beaconEvent], client);
             });
         });
     });
