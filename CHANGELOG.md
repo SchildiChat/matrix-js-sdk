@@ -1,5 +1,19 @@
+Changes in [19.5.0](https://github.com/matrix-org/matrix-js-sdk/releases/tag/v19.5.0) (2022-09-13)
+==================================================================================================
+
+## 🐛 Bug Fixes
+ * Fix bug in deepCompare which would incorrectly return objects with disjoint keys as equal ([\#2586](https://github.com/matrix-org/matrix-js-sdk/pull/2586)). Contributed by @3nprob.
+ * Refactor Sync and fix `initialSyncLimit` ([\#2587](https://github.com/matrix-org/matrix-js-sdk/pull/2587)).
+ * Use deep equality comparisons when searching for outgoing key requests by target ([\#2623](https://github.com/matrix-org/matrix-js-sdk/pull/2623)). Contributed by @duxovni.
+ * Fix room membership race with PREPARED event ([\#2613](https://github.com/matrix-org/matrix-js-sdk/pull/2613)). Contributed by @jotto.
+
 Changes in [19.4.0](https://github.com/matrix-org/matrix-js-sdk/releases/tag/v19.4.0) (2022-08-31)
 ==================================================================================================
+
+## 🔒 Security
+* Fix for [CVE-2022-36059](https://cve.mitre.org/cgi-bin/cvekey.cgi?keyword=CVE%2D2022%2D36059)
+
+Find more details at https://matrix.org/blog/2022/08/31/security-releases-matrix-js-sdk-19-4-0-and-matrix-react-sdk-3-53-0
 
 ## ✨ Features
  * Re-emit room state events on rooms ([\#2607](https://github.com/matrix-org/matrix-js-sdk/pull/2607)).
