@@ -107,7 +107,7 @@ export interface IEventRelation {
     event_id?: string;
     is_falling_back?: boolean;
     "m.in_reply_to"?: {
-        event_id: string;
+        event_id?: string;
     };
     key?: string;
 }
@@ -413,7 +413,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
         if (this.clearEvent) {
             return this.clearEvent.type;
         }
-        return this.event.type;
+        return this.event.type!;
     }
 
     /**
@@ -423,7 +423,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
      * @return {string} The event type.
      */
     public getWireType(): EventType | string {
-        return this.event.type;
+        return this.event.type!;
     }
 
     /**
@@ -441,7 +441,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
      * @return {Number} The event timestamp, e.g. <code>1433502692297</code>
      */
     public getTs(): number {
-        return this.event.origin_server_ts;
+        return this.event.origin_server_ts!;
     }
 
     /**
@@ -450,6 +450,26 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
      */
     public getDate(): Date | null {
         return this.event.origin_server_ts ? new Date(this.event.origin_server_ts) : null;
+    }
+
+    /**
+     * Get a string containing details of this event
+     *
+     * This is intended for logging, to help trace errors. Example output:
+     *
+     * id=$HjnOHV646n0SjLDAqFrgIjim7RCpB7cdMXFrekWYAn type=m.room.encrypted sender=@user:example.com room=!room:example.com ts=2022-10-25T17:30:28.404Z
+     */
+    public getDetails(): string {
+        let details = `id=${this.getId()} type=${this.getWireType()} sender=${this.getSender()}`;
+        const room = this.getRoomId();
+        if (room) {
+            details += ` room=${room}`;
+        }
+        const date = this.getDate();
+        if (date) {
+            details += ` ts=${date.toISOString()}`;
+        }
+        return details;
     }
 
     /**
@@ -625,8 +645,8 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
     ): void {
         // keep the plain-text data for 'view source'
         this.clearEvent = {
-            type: this.event.type,
-            content: this.event.content,
+            type: this.event.type!,
+            content: this.event.content!,
         };
         this.event.type = cryptoType;
         this.event.content = cryptoContent;
@@ -730,7 +750,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
         const wireContent = this.getWireContent();
         return crypto.requestRoomKey({
             algorithm: wireContent.algorithm,
-            room_id: this.getRoomId(),
+            room_id: this.getRoomId()!,
             session_id: wireContent.session_id,
             sender_key: wireContent.sender_key,
         }, this.getKeyRequestRecipients(userId), true);
@@ -780,7 +800,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
                 } else {
                     res = await crypto.decryptEvent(this);
                     if (options.isRetry === true) {
-                        logger.info(`Decrypted event on retry (id=${this.getId()})`);
+                        logger.info(`Decrypted event on retry (${this.getDetails()})`);
                     }
                 }
             } catch (e) {
@@ -790,10 +810,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
                     const re = options.isRetry ? 're' : '';
                     // For find results: this can produce "Error decrypting event (id=$ev)" and
                     // "Error redecrypting event (id=$ev)".
-                    logger.error(
-                        `Error ${re}decrypting event ` +
-                        `(id=${this.getId()}): ${e.stack || e}`,
-                    );
+                    logger.error(`Error ${re}decrypting event (${this.getDetails()})`, e);
                     this.decryptionPromise = null;
                     this.retryDecryption = false;
                     return;
@@ -817,16 +834,21 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
                 //
                 if (this.retryDecryption) {
                     // decryption error, but we have a retry queued.
-                    logger.log(`Got error decrypting event (id=${this.getId()}: ` +
-                        `${(<DecryptionError>e).detailedString}), but retrying`, e);
+                    logger.log(
+                        `Error decrypting event (${this.getDetails()}), but retrying: ` +
+                        (<DecryptionError>e).detailedString,
+                    );
                     continue;
                 }
 
                 // decryption error, no retries queued. Warn about the error and
                 // set it to m.bad.encrypted.
+                //
+                // the detailedString already includes the name and message of the error, and the stack isn't much use,
+                // so we don't bother to log `e` separately.
                 logger.warn(
-                    `Got error decrypting event (id=${this.getId()}: ${(<DecryptionError>e).detailedString})`,
-                    e,
+                    `Error decrypting event (${this.getDetails()}): ` +
+                    (<DecryptionError>e).detailedString,
                 );
 
                 res = this.badEncryptedMessage((<DecryptionError>e).message);
@@ -1007,7 +1029,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
         const value = this._localRedactionEvent;
         this._localRedactionEvent = null;
         if (this.event.unsigned) {
-            this.event.unsigned.redacted_because = null;
+            this.event.unsigned.redacted_because = undefined;
         }
         return !!value;
     }
@@ -1194,8 +1216,8 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
         if (!this.isRedacted()) return null;
 
         if (this.clearEvent?.unsigned) {
-            return this.clearEvent?.unsigned.redacted_because;
-        } else if (this.event.unsigned.redacted_because) {
+            return this.clearEvent?.unsigned.redacted_because ?? null;
+        } else if (this.event.unsigned?.redacted_because) {
             return this.event.unsigned.redacted_because;
         } else {
             return {};
@@ -1246,7 +1268,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
             this.emit(MatrixEventEvent.LocalEventIdReplaced, this);
         }
 
-        this.localTimestamp = Date.now() - this.getAge();
+        this.localTimestamp = Date.now() - this.getAge()!;
     }
 
     /**
@@ -1290,7 +1312,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
             // State events cannot be m.replace relations
             return false;
         }
-        return relation?.rel_type && relation.event_id && (relType ? relation.rel_type === relType : true);
+        return !!(relation?.rel_type && relation.event_id && (relType ? relation.rel_type === relType : true));
     }
 
     /**
@@ -1302,7 +1324,7 @@ export class MatrixEvent extends TypedEventEmitter<MatrixEventEmittedEvents, Mat
         if (!this.isRelation()) {
             return null;
         }
-        return this.getWireContent()["m.relates_to"];
+        return this.getWireContent()["m.relates_to"] ?? null;
     }
 
     /**

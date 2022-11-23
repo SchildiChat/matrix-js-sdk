@@ -93,6 +93,9 @@ const DEFAULT_OVERRIDE_RULES: IPushRule[] = [
         ],
         actions: [],
     },
+];
+
+const DEFAULT_UNDERRIDE_RULES: IPushRule[] = [
     {
         // For homeservers which don't support MSC3914 yet
         rule_id: ".org.matrix.msc3914.rule.room.call",
@@ -135,8 +138,7 @@ export class PushProcessor {
      */
     public static actionListToActionsObject(actionList: PushRuleAction[]): IActionsObject {
         const actionObj: IActionsObject = { notify: false, tweaks: {} };
-        for (let i = 0; i < actionList.length; ++i) {
-            const action = actionList[i];
+        for (const action of actionList) {
             if (action === PushRuleActionName.Notify) {
                 actionObj.notify = true;
             } else if (typeof action === 'object') {
@@ -164,6 +166,7 @@ export class PushProcessor {
         if (!newRules) newRules = {} as IPushRules;
         if (!newRules.global) newRules.global = {} as PushRuleSet;
         if (!newRules.global.override) newRules.global.override = [];
+        if (!newRules.global.override) newRules.global.underride = [];
 
         // Merge the client-level defaults with the ones from the server
         const globalOverrides = newRules.global.override;
@@ -184,21 +187,37 @@ export class PushProcessor {
             }
         }
 
+        const globalUnderrides = newRules.global.underride ?? [];
+        for (const underride of DEFAULT_UNDERRIDE_RULES) {
+            const existingRule = globalUnderrides
+                .find((r) => r.rule_id === underride.rule_id);
+
+            if (existingRule) {
+                // Copy over the actions, default, and conditions. Don't touch the user's preference.
+                existingRule.default = underride.default;
+                existingRule.conditions = underride.conditions;
+                existingRule.actions = underride.actions;
+            } else {
+                // Add the rule
+                const ruleId = underride.rule_id;
+                logger.warn(`Adding default global underride for ${ruleId}`);
+                globalUnderrides.push(underride);
+            }
+        }
+
         return newRules;
     }
 
     private static cachedGlobToRegex: Record<string, RegExp> = {}; // $glob: RegExp
 
     private matchingRuleFromKindSet(ev: MatrixEvent, kindset: PushRuleSet): IAnnotatedPushRule | null {
-        for (let ruleKindIndex = 0; ruleKindIndex < RULEKINDS_IN_ORDER.length; ++ruleKindIndex) {
-            const kind = RULEKINDS_IN_ORDER[ruleKindIndex];
+        for (const kind of RULEKINDS_IN_ORDER) {
             const ruleset = kindset[kind];
             if (!ruleset) {
                 continue;
             }
 
-            for (let ruleIndex = 0; ruleIndex < ruleset.length; ++ruleIndex) {
-                const rule = ruleset[ruleIndex];
+            for (const rule of ruleset) {
                 if (!rule.enabled) {
                     continue;
                 }
@@ -219,8 +238,11 @@ export class PushProcessor {
         return null;
     }
 
-    private templateRuleToRaw(kind: PushRuleKind, tprule: any): any {
-        const rawrule = {
+    private templateRuleToRaw(
+        kind: PushRuleKind,
+        tprule: IPushRule,
+    ): Pick<IPushRule, "rule_id" | "actions" | "conditions"> | null {
+        const rawrule: Pick<IPushRule, "rule_id" | "actions" | "conditions"> = {
             'rule_id': tprule.rule_id,
             'actions': tprule.actions,
             'conditions': [],
@@ -234,7 +256,7 @@ export class PushProcessor {
                 if (!tprule.rule_id) {
                     return null;
                 }
-                rawrule.conditions.push({
+                rawrule.conditions!.push({
                     'kind': ConditionKind.EventMatch,
                     'key': 'room_id',
                     'value': tprule.rule_id,
@@ -244,7 +266,7 @@ export class PushProcessor {
                 if (!tprule.rule_id) {
                     return null;
                 }
-                rawrule.conditions.push({
+                rawrule.conditions!.push({
                     'kind': ConditionKind.EventMatch,
                     'key': 'user_id',
                     'value': tprule.rule_id,
@@ -254,7 +276,7 @@ export class PushProcessor {
                 if (!tprule.pattern) {
                     return null;
                 }
-                rawrule.conditions.push({
+                rawrule.conditions!.push({
                     'kind': ConditionKind.EventMatch,
                     'key': 'content.body',
                     'pattern': tprule.pattern,
@@ -474,17 +496,8 @@ export class PushProcessor {
         return actionObj;
     }
 
-    public ruleMatchesEvent(rule: IPushRule, ev: MatrixEvent): boolean {
-        if (!rule.conditions?.length) return true;
-
-        let ret = true;
-        for (let i = 0; i < rule.conditions.length; ++i) {
-            const cond = rule.conditions[i];
-            // @ts-ignore
-            ret &= this.eventFulfillsCondition(cond, ev);
-        }
-        //console.log("Rule "+rule.rule_id+(ret ? " matches" : " doesn't match"));
-        return ret;
+    public ruleMatchesEvent(rule: Partial<IPushRule> & Pick<IPushRule, "conditions">, ev: MatrixEvent): boolean {
+        return !rule.conditions?.some(cond => !this.eventFulfillsCondition(cond, ev));
     }
 
     /**

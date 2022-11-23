@@ -127,6 +127,29 @@ export interface IBootstrapCrossSigningOpts {
     authUploadDeviceSigningKeys?(makeRequest: (authData: any) => Promise<{}>): Promise<void>;
 }
 
+export interface ICryptoCallbacks {
+    getCrossSigningKey?: (keyType: string, pubKey: string) => Promise<Uint8Array | null>;
+    saveCrossSigningKeys?: (keys: Record<string, Uint8Array>) => void;
+    shouldUpgradeDeviceVerifications?: (
+        users: Record<string, any>
+    ) => Promise<string[]>;
+    getSecretStorageKey?: (
+        keys: {keys: Record<string, ISecretStorageKeyInfo>}, name: string
+    ) => Promise<[string, Uint8Array] | null>;
+    cacheSecretStorageKey?: (
+        keyId: string, keyInfo: ISecretStorageKeyInfo, key: Uint8Array
+    ) => void;
+    onSecretRequested?: (
+        userId: string, deviceId: string,
+        requestId: string, secretName: string, deviceTrust: DeviceTrustLevel
+    ) => Promise<string>;
+    getDehydrationKey?: (
+        keyInfo: ISecretStorageKeyInfo,
+        checkFunc: (key: Uint8Array) => void,
+    ) => Promise<Uint8Array>;
+    getBackupKey?: () => Promise<Uint8Array>;
+}
+
 /* eslint-disable camelcase */
 interface IRoomKey {
     room_id: string;
@@ -285,8 +308,8 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
 
     private deviceKeys: Record<string, string> = {}; // type: key
 
-    private globalBlacklistUnverifiedDevices = false;
-    private globalErrorOnUnknownDevices = true;
+    public globalBlacklistUnverifiedDevices = false;
+    public globalErrorOnUnknownDevices = true;
 
     // list of IncomingRoomKeyRequests/IncomingRoomKeyRequestCancellations
     // we received in the current sync.
@@ -1752,9 +1775,11 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
         eventEmitter.on(MatrixEventEvent.Decrypted, this.onTimelineEvent);
     }
 
-    /** Start background processes related to crypto */
+    /**
+     * @deprecated this does nothing and will be removed in a future version
+     */
     public start(): void {
-        this.outgoingRoomKeyRequestManager.start();
+        logger.warn("MatrixClient.crypto.start() is deprecated");
     }
 
     /** Stop background processes related to crypto */
@@ -1788,6 +1813,9 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
      * do not specify a value.
      *
      * @param {boolean} value whether to blacklist all unverified devices by default
+     *
+     * @deprecated For external code, use {@link MatrixClient#setGlobalBlacklistUnverifiedDevices}. For
+     *   internal code, set {@link #globalBlacklistUnverifiedDevices} directly.
      */
     public setGlobalBlacklistUnverifiedDevices(value: boolean): void {
         this.globalBlacklistUnverifiedDevices = value;
@@ -1795,32 +1823,12 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
 
     /**
      * @return {boolean} whether to blacklist all unverified devices by default
+     *
+     * @deprecated For external code, use {@link MatrixClient#getGlobalBlacklistUnverifiedDevices}. For
+     *   internal code, reference {@link #globalBlacklistUnverifiedDevices} directly.
      */
     public getGlobalBlacklistUnverifiedDevices(): boolean {
         return this.globalBlacklistUnverifiedDevices;
-    }
-
-    /**
-     * Set whether sendMessage in a room with unknown and unverified devices
-     * should throw an error and not send them message. This has 'Global' for
-     * symmetry with setGlobalBlacklistUnverifiedDevices but there is currently
-     * no room-level equivalent for this setting.
-     *
-     * This API is currently UNSTABLE and may change or be removed without notice.
-     *
-     * @param {boolean} value whether error on unknown devices
-     */
-    public setGlobalErrorOnUnknownDevices(value: boolean): void {
-        this.globalErrorOnUnknownDevices = value;
-    }
-
-    /**
-     * @return {boolean} whether to error on unknown devices
-     *
-     * This API is currently UNSTABLE and may change or be removed without notice.
-     */
-    public getGlobalErrorOnUnknownDevices(): boolean {
-        return this.globalErrorOnUnknownDevices;
     }
 
     /**
@@ -2379,9 +2387,8 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
      */
     public async getOlmSessionsForUser(userId: string): Promise<Record<string, IUserOlmSession>> {
         const devices = this.getStoredDevicesForUser(userId) || [];
-        const result = {};
-        for (let j = 0; j < devices.length; ++j) {
-            const device = devices[j];
+        const result: { [deviceId: string]: IUserOlmSession } = {};
+        for (const device of devices) {
             const deviceKey = device.getIdentityKey();
             const sessions = await this.olmDevice.getSessionInfoForDevice(deviceKey);
 
@@ -2682,14 +2689,11 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
     ): Promise<Record<string, Record<string, olmlib.IOlmSessionResult>>> {
         const devicesByUser: Record<string, DeviceInfo[]> = {};
 
-        for (let i = 0; i < users.length; ++i) {
-            const userId = users[i];
+        for (const userId of users) {
             devicesByUser[userId] = [];
 
             const devices = this.getStoredDevicesForUser(userId) || [];
-            for (let j = 0; j < devices.length; ++j) {
-                const deviceInfo = devices[j];
-
+            for (const deviceInfo of devices) {
                 const key = deviceInfo.getIdentityKey();
                 if (key == this.olmDevice.deviceCurve25519Key) {
                     // don't bother setting up session to ourself

@@ -38,7 +38,7 @@ import { IOlmSessionResult } from "../olmlib";
 import { DeviceInfoMap } from "../DeviceList";
 import { MatrixEvent } from "../../models/event";
 import { EventType, MsgType } from '../../@types/event';
-import { IEventDecryptionResult, IMegolmSessionData, IncomingRoomKeyRequest } from "../index";
+import { IEncryptedContent, IEventDecryptionResult, IMegolmSessionData, IncomingRoomKeyRequest } from "../index";
 import { RoomKeyRequestState } from '../OutgoingRoomKeyRequestManager';
 import { OlmGroupSessionExtraData } from "../../@types/crypto";
 import { MatrixError } from "../../http-api";
@@ -104,12 +104,6 @@ interface IPayload extends Partial<IMessage> {
     session_id?: string;
     algorithm?: string;
     sender_key?: string;
-}
-
-interface IEncryptedContent {
-    algorithm: string;
-    sender_key: string;
-    ciphertext: Record<string, string>;
 }
 /* eslint-enable camelcase */
 
@@ -981,7 +975,7 @@ class MegolmEncryption extends EncryptionAlgorithm {
                     logger.debug(`Getting devices in ${this.roomId}`);
                     const [devicesInRoom, blocked] = await this.getDevicesInRoom(room);
 
-                    if (this.crypto.getGlobalErrorOnUnknownDevices()) {
+                    if (this.crypto.globalErrorOnUnknownDevices) {
                         // Drop unknown devices for now.  When the message gets sent, we'll
                         // throw an error, but we'll still be prepared to send to the known
                         // devices.
@@ -1034,7 +1028,7 @@ class MegolmEncryption extends EncryptionAlgorithm {
 
         // check if any of these devices are not yet known to the user.
         // if so, warn the user so they can verify or ignore.
-        if (this.crypto.getGlobalErrorOnUnknownDevices()) {
+        if (this.crypto.globalErrorOnUnknownDevices) {
             this.checkForUnknownDevices(devicesInRoom);
         }
 
@@ -1169,7 +1163,7 @@ class MegolmEncryption extends EncryptionAlgorithm {
         });
 
         // The global value is treated as a default for when rooms don't specify a value.
-        let isBlacklisting = this.crypto.getGlobalBlacklistUnverifiedDevices();
+        let isBlacklisting = this.crypto.globalBlacklistUnverifiedDevices;
         const isRoomBlacklisting = room.getBlacklistUnverifiedDevices();
         if (typeof isRoomBlacklisting === 'boolean') {
             isBlacklisting = isRoomBlacklisting;
@@ -1660,6 +1654,9 @@ class MegolmDecryption extends DecryptionAlgorithm {
                     return;
                 }
             }
+
+            // XXX: switch this to use encryptAndSendToDevices() rather than duplicating it?
+
             await olmlib.ensureOlmSessionsForDevices(
                 this.olmDevice, this.baseApis, { [sender]: [device] }, false,
             );
@@ -1716,6 +1713,8 @@ class MegolmDecryption extends DecryptionAlgorithm {
         const deviceId = keyRequest.deviceId;
         const deviceInfo = this.crypto.getStoredDevice(userId, deviceId)!;
         const body = keyRequest.requestBody;
+
+        // XXX: switch this to use encryptAndSendToDevices()?
 
         this.olmlib.ensureOlmSessionsForDevices(
             this.olmDevice, this.baseApis, {
@@ -1910,6 +1909,7 @@ class MegolmDecryption extends DecryptionAlgorithm {
         for (const [senderKey, sessionId] of sharedHistorySessions) {
             const payload = await this.buildKeyForwardingMessage(this.roomId, senderKey, sessionId);
 
+            // FIXME: use encryptAndSendToDevices() rather than duplicating it here.
             const promises: Promise<unknown>[] = [];
             const contentMap: Record<string, Record<string, IEncryptedContent>> = {};
             for (const [userId, devices] of Object.entries(devicesByUser)) {
