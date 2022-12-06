@@ -81,6 +81,7 @@ export class Thread extends ReadReceipt<EmittedEvents, EventHandlerMap> {
      * A reference to all the events ID at the bottom of the threads
      */
     public readonly timelineSet: EventTimelineSet;
+    public timeline: MatrixEvent[] = [];
 
     private _currentUserParticipated = false;
 
@@ -94,7 +95,7 @@ export class Thread extends ReadReceipt<EmittedEvents, EventHandlerMap> {
 
     public initialEventsFetched = !Thread.hasServerSideSupport;
 
-    constructor(
+    public constructor(
         public readonly id: string,
         public rootEvent: MatrixEvent | undefined,
         opts: IThreadOpts,
@@ -123,7 +124,7 @@ export class Thread extends ReadReceipt<EmittedEvents, EventHandlerMap> {
         this.room.on(MatrixEventEvent.BeforeRedaction, this.onBeforeRedaction);
         this.room.on(RoomEvent.Redaction, this.onRedaction);
         this.room.on(RoomEvent.LocalEchoUpdated, this.onEcho);
-        this.timelineSet.on(RoomEvent.Timeline, this.onEcho);
+        this.timelineSet.on(RoomEvent.Timeline, this.onTimelineEvent);
 
         // even if this thread is thought to be originating from this client, we initialise it as we may be in a
         // gappy sync and a thread around this event may already exist.
@@ -167,7 +168,7 @@ export class Thread extends ReadReceipt<EmittedEvents, EventHandlerMap> {
         Thread.hasServerSideFwdPaginationSupport = status;
     }
 
-    private onBeforeRedaction = (event: MatrixEvent, redaction: MatrixEvent) => {
+    private onBeforeRedaction = (event: MatrixEvent, redaction: MatrixEvent): void => {
         if (event?.isRelation(THREAD_RELATION_TYPE.name) &&
             this.room.eventShouldLiveIn(event).threadId === this.id &&
             event.getId() !== this.id && // the root event isn't counted in the length so ignore this redaction
@@ -178,10 +179,10 @@ export class Thread extends ReadReceipt<EmittedEvents, EventHandlerMap> {
         }
     };
 
-    private onRedaction = async (event: MatrixEvent) => {
+    private onRedaction = async (event: MatrixEvent): Promise<void> => {
         if (event.threadRootId !== this.id) return; // ignore redactions for other timelines
         if (this.replyCount <= 0) {
-            for (const threadEvent of this.events) {
+            for (const threadEvent of this.timeline) {
                 this.clearEventMetadata(threadEvent);
             }
             this.lastEvent = this.rootEvent;
@@ -192,7 +193,19 @@ export class Thread extends ReadReceipt<EmittedEvents, EventHandlerMap> {
         }
     };
 
-    private onEcho = async (event: MatrixEvent) => {
+    private onTimelineEvent = (
+        event: MatrixEvent,
+        room: Room | undefined,
+        toStartOfTimeline: boolean | undefined,
+    ): void => {
+        // Add a synthesized receipt when paginating forward in the timeline
+        if (!toStartOfTimeline) {
+            room!.addLocalEchoReceipt(event.getSender()!, event, ReceiptType.Read);
+        }
+        this.onEcho(event);
+    };
+
+    private onEcho = async (event: MatrixEvent): Promise<void> => {
         if (event.threadRootId !== this.id) return; // ignore echoes for other timelines
         if (this.lastEvent === event) return;
         if (!event.isRelation(THREAD_RELATION_TYPE.name)) return;
@@ -216,6 +229,7 @@ export class Thread extends ReadReceipt<EmittedEvents, EventHandlerMap> {
                     roomState: this.roomState,
                 },
             );
+            this.timeline = this.events;
         }
     }
 
@@ -275,6 +289,7 @@ export class Thread extends ReadReceipt<EmittedEvents, EventHandlerMap> {
             this.setEventMetadata(event);
             await this.fetchEditsWhereNeeded(event);
         }
+        this.timeline = this.events;
     }
 
     private getRootEventBundledRelationship(rootEvent = this.rootEvent): IThreadBundledRelationship | undefined {
@@ -349,7 +364,7 @@ export class Thread extends ReadReceipt<EmittedEvents, EventHandlerMap> {
     /**
      * Finds an event by ID in the current thread
      */
-    public findEventById(eventId: string) {
+    public findEventById(eventId: string): MatrixEvent | undefined {
         // Check the lastEvent as it may have been created based on a bundled relationship and not in a timeline
         if (this.lastEvent?.getId() === eventId) {
             return this.lastEvent;
@@ -361,9 +376,9 @@ export class Thread extends ReadReceipt<EmittedEvents, EventHandlerMap> {
     /**
      * Return last reply to the thread, if known.
      */
-    public lastReply(matches: (ev: MatrixEvent) => boolean = () => true): MatrixEvent | null {
-        for (let i = this.events.length - 1; i >= 0; i--) {
-            const event = this.events[i];
+    public lastReply(matches: (ev: MatrixEvent) => boolean = (): boolean => true): MatrixEvent | null {
+        for (let i = this.timeline.length - 1; i >= 0; i--) {
+            const event = this.timeline[i];
             if (matches(event)) {
                 return event;
             }
@@ -409,10 +424,6 @@ export class Thread extends ReadReceipt<EmittedEvents, EventHandlerMap> {
 
     public getUnfilteredTimelineSet(): EventTimelineSet {
         return this.timelineSet;
-    }
-
-    public get timeline(): MatrixEvent[] {
-        return this.events;
     }
 
     public addReceipt(event: MatrixEvent, synthetic: boolean): void {

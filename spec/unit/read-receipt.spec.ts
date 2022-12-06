@@ -16,11 +16,11 @@ limitations under the License.
 
 import MockHttpBackend from 'matrix-mock-request';
 
-import { ReceiptType } from '../../src/@types/read_receipts';
+import { MAIN_ROOM_TIMELINE, ReceiptType } from '../../src/@types/read_receipts';
 import { MatrixClient } from "../../src/client";
 import { Feature, ServerSupport } from '../../src/feature';
 import { EventType } from '../../src/matrix';
-import { MAIN_ROOM_TIMELINE } from '../../src/models/read-receipt';
+import { synthesizeReceipt } from '../../src/models/read-receipt';
 import { encodeUri } from '../../src/utils';
 import * as utils from "../test-utils/test-utils";
 
@@ -174,6 +174,22 @@ describe("Read receipt", () => {
 
             await httpBackend.flushAllExpected();
             await flushPromises();
+        });
+    });
+
+    describe("synthesizeReceipt", () => {
+        it.each([
+            { event: roomEvent, destinationId: MAIN_ROOM_TIMELINE },
+            { event: threadEvent, destinationId: threadEvent.threadRootId! },
+        ])("adds the receipt to $destinationId", ({ event, destinationId }) => {
+            const userId = "@bob:example.org";
+            const receiptType = ReceiptType.Read;
+
+            const fakeReadReceipt = synthesizeReceipt(userId, event, receiptType);
+
+            const content = fakeReadReceipt.getContent()[event.getId()!][receiptType][userId];
+
+            expect(content.thread_id).toEqual(destinationId);
         });
     });
 });
