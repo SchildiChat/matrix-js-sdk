@@ -1280,7 +1280,10 @@ export class MatrixCall extends TypedEventEmitter<CallEvent, CallEventHandlerMap
         setTracksEnabled(stream.getAudioTracks(), audioEnabled);
         setTracksEnabled(stream.getVideoTracks(), videoEnabled);
 
-        // We want to keep the same stream id, so we replace the tracks rather than the whole stream
+        // We want to keep the same stream id, so we replace the tracks rather
+        // than the whole stream.
+
+        // Firstly, we replace the tracks in our localUsermediaStream.
         for (const track of this.localUsermediaStream!.getTracks()) {
             this.localUsermediaStream!.removeTrack(track);
             track.stop();
@@ -1289,10 +1292,23 @@ export class MatrixCall extends TypedEventEmitter<CallEvent, CallEventHandlerMap
             this.localUsermediaStream!.addTrack(track);
         }
 
+        // Secondly, we remove tracks that we no longer need from the peer
+        // connection, if any. This only happens when we mute the video atm.
+        // This will change the transceiver direction to "inactive" and
+        // therefore cause re-negotiation.
+        for (const kind of ["audio", "video"]) {
+            const sender = this.transceivers.get(getTransceiverKey(SDPStreamMetadataPurpose.Usermedia, kind))?.sender;
+            // Only remove the track if we aren't going to immediately replace it
+            if (sender && !stream.getTracks().find((t) => t.kind === kind)) {
+                this.peerConn?.removeTrack(sender);
+            }
+        }
+        // Thirdly, we replace the old tracks, if possible.
         for (const track of stream.getTracks()) {
             const tKey = getTransceiverKey(SDPStreamMetadataPurpose.Usermedia, track.kind);
 
-            const oldSender = this.transceivers.get(tKey)?.sender;
+            const transceiver = this.transceivers.get(tKey);
+            const oldSender = transceiver?.sender;
             let added = false;
             if (oldSender) {
                 try {
@@ -1306,6 +1322,10 @@ export class MatrixCall extends TypedEventEmitter<CallEvent, CallEventHandlerMap
                             `) to peer connection`,
                     );
                     await oldSender.replaceTrack(track);
+                    // Set the direction to indicate we're going to be sending.
+                    // This is only necessary in the cases where we're upgrading
+                    // the call to video after downgrading it.
+                    transceiver.direction = transceiver.direction === "inactive" ? "sendonly" : "sendrecv";
                     added = true;
                 } catch (error) {
                     logger.warn(`replaceTrack failed: adding new transceiver instead`, error);
@@ -1349,7 +1369,12 @@ export class MatrixCall extends TypedEventEmitter<CallEvent, CallEventHandlerMap
             await this.upgradeCall(false, true);
             return this.isLocalVideoMuted();
         }
-        this.localUsermediaFeed?.setAudioVideoMuted(null, muted);
+        if (this.opponentSupportsSDPStreamMetadata()) {
+            const stream = await this.client.getMediaHandler().getUserMediaStream(true, !muted);
+            await this.updateLocalUsermediaStream(stream);
+        } else {
+            this.localUsermediaFeed?.setAudioVideoMuted(null, muted);
+        }
         this.updateMuteStatus();
         await this.sendMetadataUpdate();
         return this.isLocalVideoMuted();
@@ -2475,18 +2500,20 @@ export class MatrixCall extends TypedEventEmitter<CallEvent, CallEventHandlerMap
     }
 
     private stopAllMedia(): void {
-        logger.debug(
-            !this.groupCallId
-                ? `Call ${this.callId} stopping all media`
-                : `Call ${this.callId} stopping all media except local feeds`,
-        );
+        logger.debug(`Call ${this.callId} stopping all media`);
 
         for (const feed of this.feeds) {
-            if (feed.isLocal() && feed.purpose === SDPStreamMetadataPurpose.Usermedia && !this.groupCallId) {
+            // Slightly awkward as local feed need to go via the correct method on
+            // the mediahandler so they get removed from mediahandler (remote tracks
+            // don't)
+            // NB. We clone local streams when passing them to individual calls in a group
+            // call, so we can (and should) stop the clones once we no longer need them:
+            // the other clones will continue fine.
+            if (feed.isLocal() && feed.purpose === SDPStreamMetadataPurpose.Usermedia) {
                 this.client.getMediaHandler().stopUserMediaStream(feed.stream);
-            } else if (feed.isLocal() && feed.purpose === SDPStreamMetadataPurpose.Screenshare && !this.groupCallId) {
+            } else if (feed.isLocal() && feed.purpose === SDPStreamMetadataPurpose.Screenshare) {
                 this.client.getMediaHandler().stopScreensharingStream(feed.stream);
-            } else if (!feed.isLocal() || !this.groupCallId) {
+            } else if (!feed.isLocal()) {
                 logger.debug("Stopping remote stream", feed.stream.id);
                 for (const track of feed.stream.getTracks()) {
                     track.stop();

@@ -18,9 +18,10 @@ limitations under the License.
  * This is an internal module. See {@link MatrixClient} for the public class.
  */
 
-import { EmoteEvent, IPartialEvent, MessageEvent, NoticeEvent, Optional } from "matrix-events-sdk";
+import { Optional } from "matrix-events-sdk";
 
-import { ISyncStateData, SyncApi, SyncState } from "./sync";
+import type { IMegolmSessionData } from "./@types/crypto";
+import { ISyncStateData, SyncApi, SyncApiOptions, SyncState } from "./sync";
 import {
     EventStatus,
     IContent,
@@ -74,7 +75,6 @@ import {
     ICryptoCallbacks,
     IBootstrapCrossSigningOpts,
     ICheckOwnCrossSigningTrustOpts,
-    IMegolmSessionData,
     isCryptoAvailable,
     VerificationMethod,
     IRoomKeyRequestBody,
@@ -154,6 +154,7 @@ import {
     UNSTABLE_MSC3088_ENABLED,
     UNSTABLE_MSC3088_PURPOSE,
     UNSTABLE_MSC3089_TREE_SUBTYPE,
+    MSC3912_RELATION_BASED_REDACTIONS_PROP,
 } from "./@types/event";
 import { IdServerUnbindResult, IImageInfo, Preset, Visibility } from "./@types/partials";
 import { EventMapper, eventMapperFor, MapperOpts } from "./event-mapper";
@@ -211,6 +212,7 @@ import { LocalNotificationSettings } from "./@types/local_notifications";
 import { UNREAD_THREAD_NOTIFICATIONS } from "./@types/sync";
 import { buildFeatureSupportMap, Feature, ServerSupport } from "./feature";
 import { CryptoBackend } from "./common-crypto/CryptoBackend";
+import { RUST_SDK_STORE_PREFIX } from "./rust-crypto/constants";
 
 export type Store = IStore;
 
@@ -454,17 +456,7 @@ export interface IStartClientOpts {
     slidingSync?: SlidingSync;
 }
 
-export interface IStoredClientOpts extends IStartClientOpts {
-    // Crypto manager
-    crypto?: Crypto;
-    /**
-     * A function which is called
-     * with a room ID and returns a boolean. It should return 'true' if the SDK can
-     * SAFELY remove events from this room. It may not be safe to remove events if
-     * there are other references to the timelines for this room.
-     */
-    canResetEntireTimeline: ResetTimelineCallback;
-}
+export interface IStoredClientOpts extends IStartClientOpts {}
 
 export enum RoomVersionStability {
     Stable = "stable",
@@ -839,6 +831,11 @@ interface IRoomHierarchy {
 interface ITimestampToEventResponse {
     event_id: string;
     origin_server_ts: string;
+}
+
+interface IWhoamiResponse {
+    user_id: string;
+    device_id?: string;
 }
 /* eslint-enable camelcase */
 
@@ -1426,20 +1423,18 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             logger.error("Can't fetch server versions, continuing to initialise sync, this will be retried later", e);
         }
 
-        // shallow-copy the opts dict before modifying and storing it
-        this.clientOpts = Object.assign({}, opts) as IStoredClientOpts;
-        this.clientOpts.crypto = this.crypto;
-        this.clientOpts.canResetEntireTimeline = (roomId): boolean => {
-            if (!this.canResetTimelineCallback) {
-                return false;
-            }
-            return this.canResetTimelineCallback(roomId);
-        };
+        this.clientOpts = opts ?? {};
         if (this.clientOpts.slidingSync) {
-            this.syncApi = new SlidingSyncSdk(this.clientOpts.slidingSync, this, this.clientOpts);
+            this.syncApi = new SlidingSyncSdk(
+                this.clientOpts.slidingSync,
+                this,
+                this.clientOpts,
+                this.buildSyncApiOptions(),
+            );
         } else {
-            this.syncApi = new SyncApi(this, this.clientOpts);
+            this.syncApi = new SyncApi(this, this.clientOpts, this.buildSyncApiOptions());
         }
+
         this.syncApi.sync();
 
         if (this.clientOpts.clientWellKnownPollPeriod !== undefined) {
@@ -1450,6 +1445,22 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         }
 
         this.toDeviceMessageQueue.start();
+    }
+
+    /**
+     * Construct a SyncApiOptions for this client, suitable for passing into the SyncApi constructor
+     */
+    protected buildSyncApiOptions(): SyncApiOptions {
+        return {
+            crypto: this.crypto,
+            cryptoCallbacks: this.cryptoBackend,
+            canResetEntireTimeline: (roomId: string): boolean => {
+                if (!this.canResetTimelineCallback) {
+                    return false;
+                }
+                return this.canResetTimelineCallback(roomId);
+            },
+        };
     }
 
     /**
@@ -1657,6 +1668,45 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         if (this.cryptoStore) {
             promises.push(this.cryptoStore.deleteAllData());
         }
+
+        // delete the stores used by the rust matrix-sdk-crypto, in case they were used
+        const deleteRustSdkStore = async (): Promise<void> => {
+            let indexedDB: IDBFactory;
+            try {
+                indexedDB = global.indexedDB;
+            } catch (e) {
+                // No indexeddb support
+                return;
+            }
+            for (const dbname of [
+                `${RUST_SDK_STORE_PREFIX}::matrix-sdk-crypto`,
+                `${RUST_SDK_STORE_PREFIX}::matrix-sdk-crypto-meta`,
+            ]) {
+                const prom = new Promise((resolve, reject) => {
+                    logger.info(`Removing IndexedDB instance ${dbname}`);
+                    const req = indexedDB.deleteDatabase(dbname);
+                    req.onsuccess = (_): void => {
+                        logger.info(`Removed IndexedDB instance ${dbname}`);
+                        resolve(0);
+                    };
+                    req.onerror = (e): void => {
+                        // In private browsing, Firefox has a global.indexedDB, but attempts to delete an indexeddb
+                        // (even a non-existent one) fail with "DOMException: A mutation operation was attempted on a
+                        // database that did not allow mutations."
+                        //
+                        // it seems like the only thing we can really do is ignore the error.
+                        logger.warn(`Failed to remove IndexedDB instance ${dbname}:`, e);
+                        resolve(0);
+                    };
+                    req.onblocked = (e): void => {
+                        logger.info(`cannot yet remove IndexedDB instance ${dbname}`);
+                    };
+                });
+                await prom;
+            }
+        };
+        promises.push(deleteRustSdkStore());
+
         return Promise.all(promises).then(); // .then to fix types
     }
 
@@ -1670,6 +1720,20 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             return this.credentials.userId;
         }
         return null;
+    }
+
+    /**
+     * Get the user-id of the logged-in user
+     *
+     * @returns MXID for the logged-in user
+     * @throws Error if not logged in
+     */
+    public getSafeUserId(): string {
+        const userId = this.getUserId();
+        if (!userId) {
+            throw new Error("Expected logged in user but found none.");
+        }
+        return userId;
     }
 
     /**
@@ -2049,6 +2113,46 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             // TODO: throwing away this error is a really bad idea.
             logger.error("Error uploading device keys", e);
         });
+    }
+
+    /**
+     * Initialise support for end-to-end encryption in this client, using the rust matrix-sdk-crypto.
+     *
+     * An alternative to {@link initCrypto}.
+     *
+     * *WARNING*: this API is very experimental, should not be used in production, and may change without notice!
+     *    Eventually it will be deprecated and `initCrypto` will do the same thing.
+     *
+     * @experimental
+     *
+     * @returns a Promise which will resolve when the crypto layer has been
+     *    successfully initialised.
+     */
+    public async initRustCrypto(): Promise<void> {
+        if (this.cryptoBackend) {
+            logger.warn("Attempt to re-initialise e2e encryption on MatrixClient");
+            return;
+        }
+
+        const userId = this.getUserId();
+        if (userId === null) {
+            throw new Error(
+                `Cannot enable encryption on MatrixClient with unknown userId: ` +
+                    `ensure userId is passed in createClient().`,
+            );
+        }
+        const deviceId = this.getDeviceId();
+        if (deviceId === null) {
+            throw new Error(
+                `Cannot enable encryption on MatrixClient with unknown deviceId: ` +
+                    `ensure deviceId is passed in createClient().`,
+            );
+        }
+
+        // importing rust-crypto will download the webassembly, so we delay it until we know it will be
+        // needed.
+        const RustCrypto = await import("./rust-crypto");
+        this.cryptoBackend = await RustCrypto.initRustCrypto(this.http, userId, deviceId);
     }
 
     /**
@@ -2943,10 +3047,10 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      *    session export objects
      */
     public exportRoomKeys(): Promise<IMegolmSessionData[]> {
-        if (!this.crypto) {
+        if (!this.cryptoBackend) {
             return Promise.reject(new Error("End-to-end encryption disabled"));
         }
-        return this.crypto.exportRoomKeys();
+        return this.cryptoBackend.exportRoomKeys();
     }
 
     /**
@@ -3670,13 +3774,9 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
 
         const replacedRooms = new Set();
         for (const r of allRooms) {
-            const createEvent = r.currentState.getStateEvents(EventType.RoomCreate, "");
-            // invites are included in this list and we don't know their create events yet
-            if (createEvent) {
-                const predecessor = createEvent.getContent()["predecessor"];
-                if (predecessor && predecessor["room_id"]) {
-                    replacedRooms.add(predecessor["room_id"]);
-                }
+            const predecessor = r.findPredecessorRoomId();
+            if (predecessor) {
+                replacedRooms.add(predecessor);
             }
         }
 
@@ -3766,6 +3866,24 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         }
     }
 
+    public async deleteAccountData(eventType: string): Promise<void> {
+        const msc3391DeleteAccountDataServerSupport = this.canSupport.get(Feature.AccountDataDeletion);
+        // if deletion is not supported overwrite with empty content
+        if (msc3391DeleteAccountDataServerSupport === ServerSupport.Unsupported) {
+            await this.setAccountData(eventType, {});
+            return;
+        }
+        const path = utils.encodeUri("/user/$userId/account_data/$type", {
+            $userId: this.getSafeUserId(),
+            $type: eventType,
+        });
+        const options =
+            msc3391DeleteAccountDataServerSupport === ServerSupport.Unstable
+                ? { prefix: "/_matrix/client/unstable/org.matrix.msc3391" }
+                : undefined;
+        return await this.http.authedRequest(Method.Delete, path, undefined, undefined, options);
+    }
+
     /**
      * Gets the users that are ignored by this client
      * @returns The array of users that are ignored (empty if none)
@@ -3840,7 +3958,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             const res = await this.http.authedRequest<{ room_id: string }>(Method.Post, path, queryString, data);
 
             const roomId = res.room_id;
-            const syncApi = new SyncApi(this, this.clientOpts);
+            const syncApi = new SyncApi(this, this.clientOpts, this.buildSyncApiOptions());
             const room = syncApi.createRoom(roomId);
             if (opts.syncRoom) {
                 // v2 will do this for us
@@ -4336,9 +4454,11 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
 
     /**
      * @param txnId -  transaction id. One will be made up if not supplied.
-     * @param opts - Options to pass on, may contain `reason`.
+     * @param opts - Options to pass on, may contain `reason` and `with_relations` (MSC3912)
      * @returns Promise which resolves: TODO
      * @returns Rejects: with an error response.
+     * @throws Error if called with `with_relations` (MSC3912) but the server does not support it.
+     *         Callers should check whether the server supports MSC3912 via `MatrixClient.canSupport`.
      */
     public redactEvent(
         roomId: string,
@@ -4367,12 +4487,34 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             threadId = null;
         }
         const reason = opts?.reason;
+
+        if (
+            opts?.with_relations &&
+            this.canSupport.get(Feature.RelationBasedRedactions) === ServerSupport.Unsupported
+        ) {
+            throw new Error(
+                "Server does not support relation based redactions " +
+                    `roomId ${roomId} eventId ${eventId} txnId: ${txnId} threadId ${threadId}`,
+            );
+        }
+
+        const withRelations = opts?.with_relations
+            ? {
+                  [this.canSupport.get(Feature.RelationBasedRedactions) === ServerSupport.Stable
+                      ? MSC3912_RELATION_BASED_REDACTIONS_PROP.stable!
+                      : MSC3912_RELATION_BASED_REDACTIONS_PROP.unstable!]: opts?.with_relations,
+              }
+            : {};
+
         return this.sendCompleteEvent(
             roomId,
             threadId,
             {
                 type: EventType.RoomRedaction,
-                content: { reason },
+                content: {
+                    ...withRelations,
+                    reason,
+                },
                 redacts: eventId,
             },
             txnId as string,
@@ -4403,44 +4545,8 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             threadId = null;
         }
 
-        // Populate all outbound events with Extensible Events metadata to ensure there's a
-        // reasonably large pool of messages to parse.
-        let eventType: string = EventType.RoomMessage;
-        let sendContent: IContent = content as IContent;
-        const makeContentExtensible = (content: IContent = {}, recurse = true): IPartialEvent<object> | undefined => {
-            let newEvent: IPartialEvent<IContent> | undefined;
-
-            if (content["msgtype"] === MsgType.Text) {
-                newEvent = MessageEvent.from(content["body"], content["formatted_body"]).serialize();
-            } else if (content["msgtype"] === MsgType.Emote) {
-                newEvent = EmoteEvent.from(content["body"], content["formatted_body"]).serialize();
-            } else if (content["msgtype"] === MsgType.Notice) {
-                newEvent = NoticeEvent.from(content["body"], content["formatted_body"]).serialize();
-            }
-
-            if (newEvent && content["m.new_content"] && recurse) {
-                const newContent = makeContentExtensible(content["m.new_content"], false);
-                if (newContent) {
-                    newEvent.content["m.new_content"] = newContent.content;
-                }
-            }
-
-            if (newEvent) {
-                // copy over all other fields we don't know about
-                for (const [k, v] of Object.entries(content)) {
-                    if (!newEvent.content.hasOwnProperty(k)) {
-                        newEvent.content[k] = v;
-                    }
-                }
-            }
-
-            return newEvent;
-        };
-        const result = makeContentExtensible(sendContent);
-        if (result) {
-            eventType = result.type;
-            sendContent = result.content;
-        }
+        const eventType: string = EventType.RoomMessage;
+        const sendContent: IContent = content as IContent;
 
         return this.sendEvent(roomId, threadId as string | null, eventType, sendContent, txnId);
     }
@@ -6016,7 +6122,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      */
     public peekInRoom(roomId: string): Promise<Room> {
         this.peekSync?.stopPeeking();
-        this.peekSync = new SyncApi(this, this.clientOpts);
+        this.peekSync = new SyncApi(this, this.clientOpts, this.buildSyncApiOptions());
         return this.peekSync.peek(roomId);
     }
 
@@ -6523,7 +6629,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         if (this.syncLeftRoomsPromise) {
             return this.syncLeftRoomsPromise; // return the ongoing request
         }
-        const syncApi = new SyncApi(this, this.clientOpts);
+        const syncApi = new SyncApi(this, this.clientOpts, this.buildSyncApiOptions());
         this.syncLeftRoomsPromise = syncApi.syncLeftRooms();
 
         // cleanup locks
@@ -9242,36 +9348,58 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
     }
 
     /**
-     * Fetches the user_id of the configured access token.
+     * Fetches information about the user for the configured access token.
      */
-    public async whoami(): Promise<{ user_id: string }> {
-        // eslint-disable-line camelcase
+    public async whoami(): Promise<IWhoamiResponse> {
         return this.http.authedRequest(Method.Get, "/account/whoami");
     }
 
     /**
      * Find the event_id closest to the given timestamp in the given direction.
-     * @returns A promise of an object containing the event_id and
-     *    origin_server_ts of the closest event to the timestamp in the given
-     *    direction
+     * @returns Resolves: A promise of an object containing the event_id and
+     *    origin_server_ts of the closest event to the timestamp in the given direction
+     * @returns Rejects: when the request fails (module:http-api.MatrixError)
      */
-    public timestampToEvent(roomId: string, timestamp: number, dir: Direction): Promise<ITimestampToEventResponse> {
+    public async timestampToEvent(
+        roomId: string,
+        timestamp: number,
+        dir: Direction,
+    ): Promise<ITimestampToEventResponse> {
         const path = utils.encodeUri("/rooms/$roomId/timestamp_to_event", {
             $roomId: roomId,
         });
+        const queryParams = {
+            ts: timestamp.toString(),
+            dir: dir,
+        };
 
-        return this.http.authedRequest(
-            Method.Get,
-            path,
-            {
-                ts: timestamp.toString(),
-                dir: dir,
-            },
-            undefined,
-            {
-                prefix: "/_matrix/client/unstable/org.matrix.msc3030",
-            },
-        );
+        try {
+            return await this.http.authedRequest(Method.Get, path, queryParams, undefined, {
+                prefix: ClientPrefix.V1,
+            });
+        } catch (err) {
+            // Fallback to the prefixed unstable endpoint. Since the stable endpoint is
+            // new, we should also try the unstable endpoint before giving up. We can
+            // remove this fallback request in a year (remove after 2023-11-28).
+            if (
+                (<MatrixError>err).errcode === "M_UNRECOGNIZED" &&
+                // XXX: The 400 status code check should be removed in the future
+                // when Synapse is compliant with MSC3743.
+                ((<MatrixError>err).httpStatus === 400 ||
+                    // This the correct standard status code for an unsupported
+                    // endpoint according to MSC3743. Not Found and Method Not Allowed
+                    // both indicate that this endpoint+verb combination is
+                    // not supported.
+                    (<MatrixError>err).httpStatus === 404 ||
+                    (<MatrixError>err).httpStatus === 405)
+            ) {
+                return await this.http.authedRequest(Method.Get, path, queryParams, undefined, {
+                    prefix: "/_matrix/client/unstable/org.matrix.msc3030",
+                });
+            }
+
+            throw err;
+        }
     }
 }
 
