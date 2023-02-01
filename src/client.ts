@@ -855,6 +855,7 @@ export enum ClientEvent {
     SyncUnexpectedError = "sync.unexpectedError",
     ClientWellKnown = "WellKnown.client",
     ReceivedVoipEvent = "received_voip_event",
+    UndecryptableToDeviceEvent = "toDeviceEvent.undecryptable",
     TurnServers = "turnServers",
     TurnServersError = "turnServers.error",
 }
@@ -1063,6 +1064,18 @@ export type ClientEventHandlerMap = {
      * ```
      */
     [ClientEvent.ToDeviceEvent]: (event: MatrixEvent) => void;
+    /**
+     * Fires if a to-device event is received that cannot be decrypted.
+     * Encrypted to-device events will (generally) use plain Olm encryption,
+     * in which case decryption failures are fatal: the event will never be
+     * decryptable, unlike Megolm encrypted events where the key may simply
+     * arrive later.
+     *
+     * An undecryptable to-device event is therefore likley to indicate problems.
+     *
+     * @param event - The undecyptable to-device event
+     */
+    [ClientEvent.UndecryptableToDeviceEvent]: (event: MatrixEvent) => void;
     /**
      * Fires whenever new user-scoped account_data is added.
      * @param event - The event describing the account_data just added
@@ -2494,10 +2507,10 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      * @returns
      */
     public checkUserTrust(userId: string): UserTrustLevel {
-        if (!this.crypto) {
+        if (!this.cryptoBackend) {
             throw new Error("End-to-end encryption disabled");
         }
-        return this.crypto.checkUserTrust(userId);
+        return this.cryptoBackend.checkUserTrust(userId);
     }
 
     /**
@@ -2509,10 +2522,10 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      * @param deviceId - The ID of the device to check
      */
     public checkDeviceTrust(userId: string, deviceId: string): DeviceTrustLevel {
-        if (!this.crypto) {
+        if (!this.cryptoBackend) {
             throw new Error("End-to-end encryption disabled");
         }
-        return this.crypto.checkDeviceTrust(userId, deviceId);
+        return this.cryptoBackend.checkDeviceTrust(userId, deviceId);
     }
 
     /**
@@ -2676,10 +2689,10 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      * @returns The event information.
      */
     public getEventEncryptionInfo(event: MatrixEvent): IEncryptedEventInfo {
-        if (!this.crypto) {
+        if (!this.cryptoBackend) {
             throw new Error("End-to-end encryption disabled");
         }
-        return this.crypto.getEventEncryptionInfo(event);
+        return this.cryptoBackend.getEventEncryptionInfo(event);
     }
 
     /**
