@@ -20,7 +20,7 @@ limitations under the License.
 
 import { Optional } from "matrix-events-sdk";
 
-import type { IMegolmSessionData } from "./@types/crypto";
+import type { IDeviceKeys, IMegolmSessionData, IOneTimeKey } from "./@types/crypto";
 import { ISyncStateData, SyncApi, SyncApiOptions, SyncState } from "./sync";
 import {
     EventStatus,
@@ -85,13 +85,7 @@ import { keyFromAuthData } from "./crypto/key_passphrase";
 import { User, UserEvent, UserEventHandlerMap } from "./models/user";
 import { getHttpUriForMxc } from "./content-repo";
 import { SearchResult } from "./models/search-result";
-import {
-    DEHYDRATION_ALGORITHM,
-    IDehydratedDevice,
-    IDehydratedDeviceKeyInfo,
-    IDeviceKeys,
-    IOneTimeKey,
-} from "./crypto/dehydration";
+import { DEHYDRATION_ALGORITHM, IDehydratedDevice, IDehydratedDeviceKeyInfo } from "./crypto/dehydration";
 import {
     IKeyBackupInfo,
     IKeyBackupPrepareOpts,
@@ -1306,6 +1300,8 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             // with encrypted events that might never get decrypted
             this.on(ClientEvent.Sync, this.startCallEventHandler);
         }
+
+        this.on(ClientEvent.Sync, this.fixupRoomNotifications);
 
         this.timelineSupport = Boolean(opts.timelineSupport);
 
@@ -4135,12 +4131,12 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         roomId: string,
         userId: string | string[],
         powerLevel: number,
-        event: MatrixEvent,
+        event: MatrixEvent | null,
     ): Promise<ISendEventResponse> {
         let content = {
             users: {} as Record<string, number>,
         };
-        if (event.getType() === EventType.RoomPowerLevels) {
+        if (event?.getType() === EventType.RoomPowerLevels) {
             // take a copy of the content to ensure we don't corrupt
             // existing client state with a failed power level change
             content = utils.deepCopy(event.getContent());
@@ -6818,6 +6814,31 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
     };
 
     /**
+     * Once the client has been initialised, we want to clear notifications we
+     * know for a fact should be here.
+     * This issue should also be addressed on synapse's side and is tracked as part
+     * of https://github.com/matrix-org/synapse/issues/14837
+     *
+     * We consider a room or a thread as fully read if the current user has sent
+     * the last event in the live timeline of that context and if the read receipt
+     * we have on record matches.
+     */
+    private fixupRoomNotifications = (): void => {
+        if (this.isInitialSyncComplete()) {
+            const unreadRooms = (this.getRooms() ?? []).filter((room) => {
+                return room.getUnreadNotificationCount(NotificationCountType.Total) > 0;
+            });
+
+            for (const room of unreadRooms) {
+                const currentUserId = this.getSafeUserId();
+                room.fixupNotifications(currentUserId);
+            }
+
+            this.off(ClientEvent.Sync, this.fixupRoomNotifications);
+        }
+    };
+
+    /**
      * @returns Promise which resolves: ITurnServerResponse object
      * @returns Rejects: with an error response.
      */
@@ -9483,64 +9504,77 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
  * accurate notification_count
  */
 export function fixNotificationCountOnDecryption(cli: MatrixClient, event: MatrixEvent): void {
+    const ourUserId = cli.getUserId();
+    const eventId = event.getId();
+
+    const room = cli.getRoom(event.getRoomId());
+    if (!room || !ourUserId || !eventId) return;
+
     const oldActions = event.getPushActions();
     const actions = cli.getPushActionsForEvent(event, true);
 
-    const room = cli.getRoom(event.getRoomId());
-    if (!room || !cli.getUserId()) return;
-
     const isThreadEvent = !!event.threadRootId && !event.isThreadRoot;
 
-    const currentCount = room.getUnreadCountForEventContext(NotificationCountType.Highlight, event);
+    const currentHighlightCount = room.getUnreadCountForEventContext(NotificationCountType.Highlight, event);
 
     // Ensure the unread counts are kept up to date if the event is encrypted
     // We also want to make sure that the notification count goes up if we already
     // have encrypted events to avoid other code from resetting 'highlight' to zero.
     const oldHighlight = !!oldActions?.tweaks?.highlight;
     const newHighlight = !!actions?.tweaks?.highlight;
-    if (oldHighlight !== newHighlight || currentCount > 0) {
+
+    let hasReadEvent;
+    if (isThreadEvent) {
+        const thread = room.getThread(event.threadRootId);
+        hasReadEvent = thread
+            ? thread.hasUserReadEvent(ourUserId, eventId)
+            : // If the thread object does not exist in the room yet, we don't
+              // want to calculate notification for this event yet. We have not
+              // restored the read receipts yet and can't accurately calculate
+              // notifications at this stage.
+              //
+              // This issue can likely go away when MSC3874 is implemented
+              true;
+    } else {
+        hasReadEvent = room.hasUserReadEvent(ourUserId, eventId);
+    }
+
+    if (hasReadEvent) {
+        // If the event has been read, ignore it.
+        return;
+    }
+
+    if (oldHighlight !== newHighlight || currentHighlightCount > 0) {
         // TODO: Handle mentions received while the client is offline
         // See also https://github.com/vector-im/element-web/issues/9069
-        let hasReadEvent;
+        let newCount = currentHighlightCount;
+        if (newHighlight && !oldHighlight) newCount++;
+        if (!newHighlight && oldHighlight) newCount--;
+
         if (isThreadEvent) {
-            const thread = room.getThread(event.threadRootId);
-            hasReadEvent = thread
-                ? thread.hasUserReadEvent(cli.getUserId()!, event.getId()!)
-                : // If the thread object does not exist in the room yet, we don't
-                  // want to calculate notification for this event yet. We have not
-                  // restored the read receipts yet and can't accurately calculate
-                  // highlight notifications at this stage.
-                  //
-                  // This issue can likely go away when MSC3874 is implemented
-                  true;
+            room.setThreadUnreadNotificationCount(event.threadRootId, NotificationCountType.Highlight, newCount);
         } else {
-            hasReadEvent = room.hasUserReadEvent(cli.getUserId()!, event.getId()!);
+            room.setUnreadNotificationCount(NotificationCountType.Highlight, newCount);
         }
+    }
 
-        if (!hasReadEvent) {
-            let newCount = currentCount;
-            if (newHighlight && !oldHighlight) newCount++;
-            if (!newHighlight && oldHighlight) newCount--;
+    // Total count is used to typically increment a room notification counter, but not loudly highlight it.
+    const currentTotalCount = room.getUnreadCountForEventContext(NotificationCountType.Total, event);
 
-            if (isThreadEvent) {
-                room.setThreadUnreadNotificationCount(event.threadRootId, NotificationCountType.Highlight, newCount);
-            } else {
-                room.setUnreadNotificationCount(NotificationCountType.Highlight, newCount);
-            }
+    // `notify` is used in practice for incrementing the total count
+    const newNotify = !!actions?.notify;
 
-            // Fix 'Mentions Only' rooms from not having the right badge count
-            const totalCount =
-                (isThreadEvent
-                    ? room.getThreadUnreadNotificationCount(event.threadRootId, NotificationCountType.Total)
-                    : room.getRoomUnreadNotificationCount(NotificationCountType.Total)) ?? 0;
-
-            if (totalCount < newCount) {
-                if (isThreadEvent) {
-                    room.setThreadUnreadNotificationCount(event.threadRootId, NotificationCountType.Total, newCount);
-                } else {
-                    room.setUnreadNotificationCount(NotificationCountType.Total, newCount);
-                }
-            }
+    // The room total count is NEVER incremented by the server for encrypted rooms. We basically ignore
+    // the server here as it's always going to tell us to increment for encrypted events.
+    if (newNotify) {
+        if (isThreadEvent) {
+            room.setThreadUnreadNotificationCount(
+                event.threadRootId,
+                NotificationCountType.Total,
+                currentTotalCount + 1,
+            );
+        } else {
+            room.setUnreadNotificationCount(NotificationCountType.Total, currentTotalCount + 1);
         }
     }
 }
