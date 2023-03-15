@@ -62,6 +62,7 @@ export function isDmMemberCountCondition(condition: AnyMemberCountCondition): bo
 
 export enum ConditionKind {
     EventMatch = "event_match",
+    EventPropertyIs = "event_property_is",
     ContainsDisplayName = "contains_display_name",
     RoomMemberCount = "room_member_count",
     SenderNotificationPermission = "sender_notification_permission",
@@ -77,7 +78,14 @@ export interface IPushRuleCondition<N extends ConditionKind | string> {
 export interface IEventMatchCondition extends IPushRuleCondition<ConditionKind.EventMatch> {
     key: string;
     pattern?: string;
+    // Note that value property is an optimization for patterns which do not do
+    // any globbing and when the key is not "content.body".
     value?: string;
+}
+
+export interface IEventPropertyIsCondition extends IPushRuleCondition<ConditionKind.EventPropertyIs> {
+    key: string;
+    value: string | boolean | null | number;
 }
 
 export interface IContainsDisplayNameCondition extends IPushRuleCondition<ConditionKind.ContainsDisplayName> {
@@ -105,6 +113,7 @@ export interface ICallStartedPrefixCondition extends IPushRuleCondition<Conditio
 // IPushRuleCondition<Exclude<string, ConditionKind>> unfortunately does not resolve this at the time of writing.
 export type PushRuleCondition =
     | IEventMatchCondition
+    | IEventPropertyIsCondition
     | IContainsDisplayNameCondition
     | IRoomMemberCountCondition
     | ISenderNotificationPermissionCondition
@@ -133,6 +142,14 @@ export enum RuleId {
     IncomingCall = ".m.rule.call",
     SuppressNotices = ".m.rule.suppress_notices",
     Tombstone = ".m.rule.tombstone",
+    PollStart = ".m.rule.poll_start",
+    PollStartUnstable = ".org.matrix.msc3930.rule.poll_start",
+    PollEnd = ".m.rule.poll_end",
+    PollEndUnstable = ".org.matrix.msc3930.rule.poll_end",
+    PollStartOneToOne = ".m.rule.poll_start_one_to_one",
+    PollStartOneToOneUnstable = ".org.matrix.msc3930.rule.poll_start_one_to_one",
+    PollEndOneToOne = ".m.rule.poll_end_one_to_one",
+    PollEndOneToOneUnstable = ".org.matrix.msc3930.rule.poll_end_one_to_one",
 }
 
 export type PushRuleSet = {

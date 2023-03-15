@@ -371,6 +371,13 @@ export interface ICreateClientOpts {
      * Defaults to a built-in English handler with basic pluralisation.
      */
     roomNameGenerator?: (roomId: string, state: RoomNameState) => string | null;
+
+    /**
+     * If true, participant can join group call without video and audio this has to be allowed. By default, a local
+     * media stream is needed to establish a group call.
+     * Default: false.
+     */
+    isVoipWithNoMediaAllowed?: boolean;
 }
 
 export interface IMatrixClientCreateOpts extends ICreateClientOpts {
@@ -1169,6 +1176,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
     public iceCandidatePoolSize = 0; // XXX: Intended private, used in code.
     public idBaseUrl?: string;
     public baseUrl: string;
+    public readonly isVoipWithNoMediaAllowed;
 
     // Note: these are all `protected` to let downstream consumers make mistakes if they want to.
     // We don't technically support this usage, but have reasons to do this.
@@ -1313,6 +1321,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         this.iceCandidatePoolSize = opts.iceCandidatePoolSize === undefined ? 0 : opts.iceCandidatePoolSize;
         this.supportsCallTransfer = opts.supportsCallTransfer || false;
         this.fallbackICEServerAllowed = opts.fallbackICEServerAllowed || false;
+        this.isVoipWithNoMediaAllowed = opts.isVoipWithNoMediaAllowed || false;
 
         if (opts.useE2eForGroupCall !== undefined) this.useE2eForGroupCall = opts.useE2eForGroupCall;
 
@@ -1880,6 +1889,8 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             throw new Error(`Cannot find room ${roomId}`);
         }
 
+        // Because without Media section a WebRTC connection is not possible, so need a RTCDataChannel to set up a
+        // no media WebRTC connection anyway.
         return new GroupCall(
             this,
             room,
@@ -1887,8 +1898,9 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             isPtt,
             intent,
             undefined,
-            dataChannelsEnabled,
+            dataChannelsEnabled || this.isVoipWithNoMediaAllowed,
             dataChannelOptions,
+            this.isVoipWithNoMediaAllowed,
         ).create();
     }
 
@@ -4130,7 +4142,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
     public setPowerLevel(
         roomId: string,
         userId: string | string[],
-        powerLevel: number,
+        powerLevel: number | undefined,
         event: MatrixEvent | null,
     ): Promise<ISendEventResponse> {
         let content = {
@@ -4141,13 +4153,16 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             // existing client state with a failed power level change
             content = utils.deepCopy(event.getContent());
         }
-        if (Array.isArray(userId)) {
-            for (const user of userId) {
+
+        const users = Array.isArray(userId) ? userId : [userId];
+        for (const user of users) {
+            if (powerLevel == null) {
+                delete content.users[user];
+            } else {
                 content.users[user] = powerLevel;
             }
-        } else {
-            content.users[userId] = powerLevel;
         }
+
         const path = utils.encodeUri("/rooms/$roomId/state/m.room.power_levels", {
             $roomId: roomId,
         });
@@ -8496,8 +8511,20 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      */
     public getPushRules(): Promise<IPushRules> {
         return this.http.authedRequest<IPushRules>(Method.Get, "/pushrules/").then((rules: IPushRules) => {
-            return PushProcessor.rewriteDefaultRules(rules);
+            this.setPushRules(rules);
+            return this.pushRules!;
         });
+    }
+
+    /**
+     * Update the push rules for the account. This should be called whenever
+     * updated push rules are available.
+     */
+    public setPushRules(rules: IPushRules): void {
+        // Fix-up defaults, if applicable.
+        this.pushRules = PushProcessor.rewriteDefaultRules(rules);
+        // Pre-calculate any necessary caches.
+        this.pushProcessor.updateCachedPushRuleKeys(this.pushRules);
     }
 
     /**
@@ -8746,18 +8773,19 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         email: string,
         clientSecret: string,
         sendAttempt: number,
-        nextLink: string,
+        nextLink?: string,
         identityAccessToken?: string,
-    ): Promise<any> {
-        // TODO: Types
-        const params = {
+    ): Promise<IRequestTokenResponse> {
+        const params: Record<string, string> = {
             client_secret: clientSecret,
             email: email,
             send_attempt: sendAttempt?.toString(),
-            next_link: nextLink,
         };
+        if (nextLink) {
+            params.next_link = nextLink;
+        }
 
-        return this.http.idServerRequest(
+        return this.http.idServerRequest<IRequestTokenResponse>(
             Method.Post,
             "/validate/email/requestToken",
             params,
@@ -8788,7 +8816,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      * @param identityAccessToken - The `access_token` field of the Identity
      * Server `/account/register` response (see {@link registerWithIdentityServer}).
      *
-     * @returns Promise which resolves: TODO
+     * @returns Promise which resolves to an object with a sid string
      * @returns Rejects: with an error response.
      * @throws Error if no identity server is set
      */
@@ -8797,19 +8825,20 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         phoneNumber: string,
         clientSecret: string,
         sendAttempt: number,
-        nextLink: string,
+        nextLink?: string,
         identityAccessToken?: string,
-    ): Promise<any> {
-        // TODO: Types
-        const params = {
+    ): Promise<IRequestMsisdnTokenResponse> {
+        const params: Record<string, string> = {
             client_secret: clientSecret,
             country: phoneCountry,
             phone_number: phoneNumber,
             send_attempt: sendAttempt?.toString(),
-            next_link: nextLink,
         };
+        if (nextLink) {
+            params.next_link = nextLink;
+        }
 
-        return this.http.idServerRequest(
+        return this.http.idServerRequest<IRequestMsisdnTokenResponse>(
             Method.Post,
             "/validate/msisdn/requestToken",
             params,
