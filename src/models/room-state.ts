@@ -467,7 +467,7 @@ export class RoomState extends TypedEventEmitter<EmittedEvents, EventHandlerMap>
         this.emit(RoomStateEvent.Update, this);
     }
 
-    public processBeaconEvents(events: MatrixEvent[], matrixClient: MatrixClient): void {
+    public async processBeaconEvents(events: MatrixEvent[], matrixClient: MatrixClient): Promise<void> {
         if (
             !events.length ||
             // discard locations if we have no beacons
@@ -476,10 +476,10 @@ export class RoomState extends TypedEventEmitter<EmittedEvents, EventHandlerMap>
             return;
         }
 
-        const beaconByEventIdDict: Record<string, Beacon> = [...this.beacons.values()].reduce(
-            (dict, beacon) => ({ ...dict, [beacon.beaconInfoId]: beacon }),
-            {},
-        );
+        const beaconByEventIdDict = [...this.beacons.values()].reduce<Record<string, Beacon>>((dict, beacon) => {
+            dict[beacon.beaconInfoId] = beacon;
+            return dict;
+        }, {});
 
         const processBeaconRelation = (beaconInfoEventId: string, event: MatrixEvent): void => {
             if (!M_BEACON.matches(event.getType())) {
@@ -493,22 +493,24 @@ export class RoomState extends TypedEventEmitter<EmittedEvents, EventHandlerMap>
             }
         };
 
-        events.forEach((event: MatrixEvent) => {
+        for (const event of events) {
             const relatedToEventId = event.getRelation()?.event_id;
             // not related to a beacon we know about; discard
             if (!relatedToEventId || !beaconByEventIdDict[relatedToEventId]) return;
+            if (!M_BEACON.matches(event.getType()) && !event.isEncrypted()) return;
 
-            matrixClient.decryptEventIfNeeded(event);
-
-            if (event.isBeingDecrypted() || event.isDecryptionFailure()) {
-                // add an event listener for once the event is decrypted.
-                event.once(MatrixEventEvent.Decrypted, async () => {
-                    processBeaconRelation(relatedToEventId, event);
-                });
-            } else {
+            try {
+                await matrixClient.decryptEventIfNeeded(event);
                 processBeaconRelation(relatedToEventId, event);
+            } catch {
+                if (event.isDecryptionFailure()) {
+                    // add an event listener for once the event is decrypted.
+                    event.once(MatrixEventEvent.Decrypted, async () => {
+                        processBeaconRelation(relatedToEventId, event);
+                    });
+                }
             }
-        });
+        }
     }
 
     /**
@@ -970,13 +972,21 @@ export class RoomState extends TypedEventEmitter<EmittedEvents, EventHandlerMap>
      * @param msc3946ProcessDynamicPredecessor - if true, look for an
      * m.room.predecessor state event and use it if found (MSC3946).
      * @returns null if this room has no predecessor. Otherwise, returns
-     * the roomId and last eventId of the predecessor room.
+     * the roomId, last eventId and viaServers of the predecessor room.
+     *
      * If msc3946ProcessDynamicPredecessor is true, use m.predecessor events
      * as well as m.room.create events to find predecessors.
+     *
      * Note: if an m.predecessor event is used, eventId may be undefined
      * since last_known_event_id is optional.
+     *
+     * Note: viaServers may be undefined, and will definitely be undefined if
+     * this predecessor comes from a RoomCreate event (rather than a
+     * RoomPredecessor, which has the optional via_servers property).
      */
-    public findPredecessor(msc3946ProcessDynamicPredecessor = false): { roomId: string; eventId?: string } | null {
+    public findPredecessor(
+        msc3946ProcessDynamicPredecessor = false,
+    ): { roomId: string; eventId?: string; viaServers?: string[] } | null {
         // Note: the tests for this function are against Room.findPredecessor,
         // which just calls through to here.
 
@@ -986,14 +996,19 @@ export class RoomState extends TypedEventEmitter<EmittedEvents, EventHandlerMap>
                 const content = predecessorEvent.getContent<{
                     predecessor_room_id: string;
                     last_known_event_id?: string;
+                    via_servers?: string[];
                 }>();
                 const roomId = content.predecessor_room_id;
                 let eventId = content.last_known_event_id;
                 if (typeof eventId !== "string") {
                     eventId = undefined;
                 }
+                let viaServers = content.via_servers;
+                if (!Array.isArray(viaServers)) {
+                    viaServers = undefined;
+                }
                 if (typeof roomId === "string") {
-                    return { roomId, eventId };
+                    return { roomId, eventId, viaServers };
                 }
             }
         }

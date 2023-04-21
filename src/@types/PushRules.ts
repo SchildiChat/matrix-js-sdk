@@ -63,6 +63,7 @@ export function isDmMemberCountCondition(condition: AnyMemberCountCondition): bo
 export enum ConditionKind {
     EventMatch = "event_match",
     EventPropertyIs = "event_property_is",
+    EventPropertyContains = "event_property_contains",
     ContainsDisplayName = "contains_display_name",
     RoomMemberCount = "room_member_count",
     SenderNotificationPermission = "sender_notification_permission",
@@ -84,6 +85,11 @@ export interface IEventMatchCondition extends IPushRuleCondition<ConditionKind.E
 }
 
 export interface IEventPropertyIsCondition extends IPushRuleCondition<ConditionKind.EventPropertyIs> {
+    key: string;
+    value: string | boolean | null | number;
+}
+
+export interface IEventPropertyContainsCondition extends IPushRuleCondition<ConditionKind.EventPropertyContains> {
     key: string;
     value: string | boolean | null | number;
 }
@@ -114,6 +120,7 @@ export interface ICallStartedPrefixCondition extends IPushRuleCondition<Conditio
 export type PushRuleCondition =
     | IEventMatchCondition
     | IEventPropertyIsCondition
+    | IEventPropertyContainsCondition
     | IContainsDisplayNameCondition
     | IRoomMemberCountCondition
     | ISenderNotificationPermissionCondition
@@ -130,6 +137,8 @@ export enum PushRuleKind {
 
 export enum RuleId {
     Master = ".m.rule.master",
+    IsUserMention = ".org.matrix.msc3952.is_user_mention",
+    IsRoomMention = ".org.matrix.msc3952.is_room_mention",
     ContainsDisplayName = ".m.rule.contains_display_name",
     ContainsUserName = ".m.rule.contains_user_name",
     AtRoomNotification = ".m.rule.roomnotif",

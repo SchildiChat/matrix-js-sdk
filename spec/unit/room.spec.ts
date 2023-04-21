@@ -390,36 +390,30 @@ describe("Room", function () {
             remoteEvent.event.unsigned = { transaction_id: "TXN_ID" };
             const remoteEventId = remoteEvent.getId();
 
-            let callCount = 0;
-            room.on(RoomEvent.LocalEchoUpdated, (event, emitRoom, oldEventId, oldStatus) => {
-                switch (callCount) {
-                    case 0:
-                        expect(event.getId()).toEqual(localEventId);
-                        expect(event.status).toEqual(EventStatus.SENDING);
-                        expect(emitRoom).toEqual(room);
-                        expect(oldEventId).toBeUndefined();
-                        expect(oldStatus).toBeUndefined();
-                        break;
-                    case 1:
-                        expect(event.getId()).toEqual(remoteEventId);
-                        expect(event.status).toBeNull();
-                        expect(emitRoom).toEqual(room);
-                        expect(oldEventId).toEqual(localEventId);
-                        expect(oldStatus).toBe(EventStatus.SENDING);
-                        break;
-                }
-                callCount += 1;
-            });
+            const stub = jest.fn();
+            room.on(RoomEvent.LocalEchoUpdated, stub);
 
             // first add the local echo
             room.addPendingEvent(localEvent, "TXN_ID");
             expect(room.timeline.length).toEqual(1);
 
+            expect(stub.mock.calls[0][0].getId()).toEqual(localEventId);
+            expect(stub.mock.calls[0][0].status).toEqual(EventStatus.SENDING);
+            expect(stub.mock.calls[0][1]).toEqual(room);
+            expect(stub.mock.calls[0][2]).toBeUndefined();
+            expect(stub.mock.calls[0][3]).toBeUndefined();
+
             // then the remoteEvent
             room.addLiveEvents([remoteEvent]);
             expect(room.timeline.length).toEqual(1);
 
-            expect(callCount).toEqual(2);
+            expect(stub).toHaveBeenCalledTimes(2);
+
+            expect(stub.mock.calls[1][0].getId()).toEqual(remoteEventId);
+            expect(stub.mock.calls[1][0].status).toBeNull();
+            expect(stub.mock.calls[1][1]).toEqual(room);
+            expect(stub.mock.calls[1][2]).toEqual(localEventId);
+            expect(stub.mock.calls[1][3]).toBe(EventStatus.SENDING);
         });
 
         it("should be able to update local echo without a txn ID (/send then /sync)", function () {
@@ -3349,11 +3343,16 @@ describe("Room", function () {
             newRoomId: string,
             predecessorRoomId: string,
             tombstoneEventId: string | null = null,
+            viaServers: string[] = [],
         ): MatrixEvent {
             const content =
                 tombstoneEventId === null
-                    ? { predecessor_room_id: predecessorRoomId }
-                    : { predecessor_room_id: predecessorRoomId, last_known_event_id: tombstoneEventId };
+                    ? { predecessor_room_id: predecessorRoomId, via_servers: viaServers }
+                    : {
+                          predecessor_room_id: predecessorRoomId,
+                          last_known_event_id: tombstoneEventId,
+                          via_servers: viaServers,
+                      };
 
             return new MatrixEvent({
                 content,
@@ -3393,6 +3392,7 @@ describe("Room", function () {
             expect(room.findPredecessor(useMsc3946)).toEqual({
                 roomId: "otherreplacedroomid",
                 eventId: undefined, // m.predecessor did not include an event_id
+                viaServers: [],
             });
         });
 
@@ -3400,12 +3400,13 @@ describe("Room", function () {
             const room = new Room("roomid", client!, "@u:example.com");
             room.addLiveEvents([
                 roomCreateEvent("roomid", "replacedroomid"),
-                predecessorEvent("roomid", "otherreplacedroomid", "lstevtid"),
+                predecessorEvent("roomid", "otherreplacedroomid", "lstevtid", ["one.example.com", "two.example.com"]),
             ]);
             const useMsc3946 = true;
             expect(room.findPredecessor(useMsc3946)).toEqual({
                 roomId: "otherreplacedroomid",
                 eventId: "lstevtid",
+                viaServers: ["one.example.com", "two.example.com"],
             });
         });
 

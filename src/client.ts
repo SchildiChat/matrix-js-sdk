@@ -106,7 +106,6 @@ import {
     IEncryptedEventInfo,
     IImportRoomKeysOpts,
     IRecoveryKey,
-    ISecretStorageKeyInfo,
 } from "./crypto/api";
 import { EventTimelineSet } from "./models/event-timeline-set";
 import { VerificationRequest } from "./crypto/verification/request/VerificationRequest";
@@ -206,7 +205,9 @@ import { LocalNotificationSettings } from "./@types/local_notifications";
 import { buildFeatureSupportMap, Feature, ServerSupport } from "./feature";
 import { CryptoBackend } from "./common-crypto/CryptoBackend";
 import { RUST_SDK_STORE_PREFIX } from "./rust-crypto/constants";
+import { CryptoApi } from "./crypto-api";
 import { DeviceInfoMap } from "./crypto/DeviceList";
+import { SecretStorageKeyDescription } from "./secret-storage";
 
 export type Store = IStore;
 
@@ -461,6 +462,11 @@ export interface IStartClientOpts {
      * @experimental
      */
     slidingSync?: SlidingSync;
+
+    /**
+     * @experimental
+     */
+    intentionalMentions?: boolean;
 }
 
 export interface IStoredClientOpts extends IStartClientOpts {}
@@ -839,7 +845,7 @@ interface IRoomHierarchy {
     next_batch?: string;
 }
 
-interface ITimestampToEventResponse {
+export interface TimestampToEventResponse {
     event_id: string;
     origin_server_ts: string;
 }
@@ -1169,7 +1175,15 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
     public urlPreviewCache: { [key: string]: Promise<IPreviewUrlResponse> } = {};
     public identityServer?: IIdentityServerProvider;
     public http: MatrixHttpApi<IHttpOpts & { onlyData: true }>; // XXX: Intended private, used in code.
-    public crypto?: Crypto; // libolm crypto implementation. XXX: Intended private, used in code. Being replaced by cryptoBackend
+
+    /**
+     * The libolm crypto implementation, if it is in use.
+     *
+     * @deprecated This should not be used. Instead, use the methods exposed directly on this class or
+     * (where they are available) via {@link getCrypto}.
+     */
+    public crypto?: Crypto; // XXX: Intended private, used in code. Being replaced by cryptoBackend
+
     private cryptoBackend?: CryptoBackend; // one of crypto or rustCrypto
     public cryptoCallbacks: ICryptoCallbacks; // XXX: Intended private, used in code.
     public callEventHandler?: CallEventHandler; // XXX: Intended private, used in code.
@@ -2204,8 +2218,19 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
     }
 
     /**
+     * Access the crypto API for this client.
+     *
+     * If end-to-end encryption has been enabled for this client (via {@link initCrypto} or {@link initRustCrypto}),
+     * returns an object giving access to the crypto API. Otherwise, returns `undefined`.
+     */
+    public getCrypto(): CryptoApi | undefined {
+        return this.cryptoBackend;
+    }
+
+    /**
      * Is end-to-end crypto enabled for this client.
      * @returns True if end-to-end is enabled.
+     * @deprecated prefer {@link getCrypto}
      */
     public isCryptoEnabled(): boolean {
         return !!this.cryptoBackend;
@@ -2438,7 +2463,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         return this.crypto.beginKeyVerification(method, userId, deviceId);
     }
 
-    public checkSecretStorageKey(key: Uint8Array, info: ISecretStorageKeyInfo): Promise<boolean> {
+    public checkSecretStorageKey(key: Uint8Array, info: SecretStorageKeyDescription): Promise<boolean> {
         if (!this.crypto) {
             throw new Error("End-to-end encryption disabled");
         }
@@ -2451,6 +2476,12 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      * do not specify a value.
      *
      * @param value - whether to blacklist all unverified devices by default
+     *
+     * @deprecated Prefer direct access to {@link CryptoApi.globalBlacklistUnverifiedDevices}:
+     *
+     * ```javascript
+     * client.getCrypto().globalBlacklistUnverifiedDevices = value;
+     * ```
      */
     public setGlobalBlacklistUnverifiedDevices(value: boolean): boolean {
         if (!this.cryptoBackend) {
@@ -2462,6 +2493,12 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
 
     /**
      * @returns whether to blacklist all unverified devices by default
+     *
+     * @deprecated Prefer direct access to {@link CryptoApi.globalBlacklistUnverifiedDevices}:
+     *
+     * ```javascript
+     * value = client.getCrypto().globalBlacklistUnverifiedDevices;
+     * ```
      */
     public getGlobalBlacklistUnverifiedDevices(): boolean {
         if (!this.cryptoBackend) {
@@ -2479,6 +2516,12 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      * This API is currently UNSTABLE and may change or be removed without notice.
      *
      * @param value - whether error on unknown devices
+     *
+     * @deprecated Prefer direct access to {@link CryptoApi.globalBlacklistUnverifiedDevices}:
+     *
+     * ```ts
+     * client.getCrypto().globalBlacklistUnverifiedDevices = value;
+     * ```
      */
     public setGlobalErrorOnUnknownDevices(value: boolean): void {
         if (!this.cryptoBackend) {
@@ -2538,8 +2581,6 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      * The cross-signing API is currently UNSTABLE and may change without notice.
      *
      * @param userId - The ID of the user to check.
-     *
-     * @returns
      */
     public checkUserTrust(userId: string): UserTrustLevel {
         if (!this.cryptoBackend) {
@@ -2621,6 +2662,12 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      * Perform any background tasks that can be done before a message is ready to
      * send, in order to speed up sending of the message.
      * @param room - the room the event is in
+     *
+     * @deprecated Prefer {@link CryptoApi.prepareToEncrypt | `CryptoApi.prepareToEncrypt`}:
+     *
+     * ```javascript
+     * client.getCrypto().prepareToEncrypt(room);
+     * ```
      */
     public prepareToEncrypt(room: Room): void {
         if (!this.cryptoBackend) {
@@ -2634,6 +2681,12 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      *
      * This means downloading the devicelist for the user and checking if the list includes
      * the cross-signing pseudo-device.
+     *
+     * @deprecated Prefer {@link CryptoApi.userHasCrossSigningKeys | `CryptoApi.userHasCrossSigningKeys`}:
+     *
+     * ```javascript
+     * result = client.getCrypto().userHasCrossSigningKeys();
+     * ```
      */
     public userHasCrossSigningKeys(): Promise<boolean> {
         if (!this.cryptoBackend) {
@@ -2810,7 +2863,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         algorithm: string,
         opts: IAddSecretStorageKeyOpts,
         keyName?: string,
-    ): Promise<{ keyId: string; keyInfo: ISecretStorageKeyInfo }> {
+    ): Promise<{ keyId: string; keyInfo: SecretStorageKeyDescription }> {
         if (!this.crypto) {
             throw new Error("End-to-end encryption disabled");
         }
@@ -2876,7 +2929,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      *     with, or null if it is not present or not encrypted with a trusted
      *     key
      */
-    public isSecretStored(name: string): Promise<Record<string, ISecretStorageKeyInfo> | null> {
+    public isSecretStored(name: string): Promise<Record<string, SecretStorageKeyDescription> | null> {
         if (!this.crypto) {
             throw new Error("End-to-end encryption disabled");
         }
@@ -3077,13 +3130,14 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      *
      * @param roomId - The ID of the room to discard the session for
      *
-     * This should not normally be necessary.
+     * @deprecated Prefer {@link CryptoApi.forceDiscardSession | `CryptoApi.forceDiscardSession`}:
+     *
      */
     public forceDiscardSession(roomId: string): void {
-        if (!this.crypto) {
+        if (!this.cryptoBackend) {
             throw new Error("End-to-End encryption disabled");
         }
-        this.crypto.forceDiscardSession(roomId);
+        this.cryptoBackend.forceDiscardSession(roomId);
     }
 
     /**
@@ -3091,8 +3145,13 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      *
      * This should be encrypted before returning it to the user.
      *
-     * @returns a promise which resolves to a list of
-     *    session export objects
+     * @returns a promise which resolves to a list of session export objects
+     *
+     * @deprecated Prefer {@link CryptoApi.exportRoomKeys | `CryptoApi.exportRoomKeys`}:
+     *
+     * ```javascript
+     * sessionData = await client.getCrypto().exportRoomKeys();
+     * ```
      */
     public exportRoomKeys(): Promise<IMegolmSessionData[]> {
         if (!this.cryptoBackend) {
@@ -3247,7 +3306,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      *     encrypted with, or null if it is not present or not encrypted with a
      *     trusted key
      */
-    public isKeyBackupKeyStored(): Promise<Record<string, ISecretStorageKeyInfo> | null> {
+    public isKeyBackupKeyStored(): Promise<Record<string, SecretStorageKeyDescription> | null> {
         return Promise.resolve(this.isSecretStored("m.megolm_backup.v1"));
     }
 
@@ -8527,7 +8586,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      */
     public setPushRules(rules: IPushRules): void {
         // Fix-up defaults, if applicable.
-        this.pushRules = PushProcessor.rewriteDefaultRules(rules);
+        this.pushRules = PushProcessor.rewriteDefaultRules(rules, this.getUserId()!);
         // Pre-calculate any necessary caches.
         this.pushProcessor.updateCachedPushRuleKeys(this.pushRules);
     }
@@ -9423,6 +9482,15 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
     }
 
     /**
+     * A helper to determine intentional mentions support
+     * @returns a boolean to determine if intentional mentions are enabled
+     * @experimental
+     */
+    public supportsIntentionalMentions(): boolean {
+        return this.clientOpts?.intentionalMentions || false;
+    }
+
+    /**
      * Fetches the summary of a room as defined by an initial version of MSC3266 and implemented in Synapse
      * Proposed at https://github.com/matrix-org/matrix-doc/pull/3266
      * @param roomIdOrAlias - The ID or alias of the room to get the summary of.
@@ -9491,7 +9559,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         roomId: string,
         timestamp: number,
         dir: Direction,
-    ): Promise<ITimestampToEventResponse> {
+    ): Promise<TimestampToEventResponse> {
         const path = utils.encodeUri("/rooms/$roomId/timestamp_to_event", {
             $roomId: roomId,
         });

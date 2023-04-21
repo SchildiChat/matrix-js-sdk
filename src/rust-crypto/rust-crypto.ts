@@ -34,7 +34,6 @@ import { KeyClaimManager } from "./KeyClaimManager";
  * An implementation of {@link CryptoBackend} using the Rust matrix-sdk-crypto.
  */
 export class RustCrypto implements CryptoBackend {
-    public globalBlacklistUnverifiedDevices = false;
     public globalErrorOnUnknownDevices = false;
 
     /** whether {@link stop} has been called */
@@ -79,14 +78,6 @@ export class RustCrypto implements CryptoBackend {
         // cleaned up; in particular, the indexeddb connections will be closed, which means they
         // can then be deleted.
         this.olmMachine.close();
-    }
-
-    public prepareToEncrypt(room: Room): void {
-        const encryptor = this.roomEncryptors[room.roomId];
-
-        if (encryptor) {
-            encryptor.ensureEncryptionSession();
-        }
     }
 
     public async encryptEvent(event: MatrixEvent, _room: Room): Promise<void> {
@@ -147,16 +138,6 @@ export class RustCrypto implements CryptoBackend {
         return ret as IEncryptedEventInfo;
     }
 
-    public async userHasCrossSigningKeys(): Promise<boolean> {
-        // TODO
-        return false;
-    }
-
-    public async exportRoomKeys(): Promise<IMegolmSessionData[]> {
-        // TODO
-        return [];
-    }
-
     public checkUserTrust(userId: string): UserTrustLevel {
         // TODO
         return new UserTrustLevel(false, false, false);
@@ -169,27 +150,94 @@ export class RustCrypto implements CryptoBackend {
 
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     //
+    // CryptoApi implementation
+    //
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    public globalBlacklistUnverifiedDevices = false;
+
+    public async userHasCrossSigningKeys(): Promise<boolean> {
+        // TODO
+        return false;
+    }
+
+    public prepareToEncrypt(room: Room): void {
+        const encryptor = this.roomEncryptors[room.roomId];
+
+        if (encryptor) {
+            encryptor.ensureEncryptionSession();
+        }
+    }
+
+    public forceDiscardSession(roomId: string): Promise<void> {
+        return this.roomEncryptors[roomId]?.forceDiscardSession();
+    }
+
+    public async exportRoomKeys(): Promise<IMegolmSessionData[]> {
+        // TODO
+        return [];
+    }
+
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    //
     // SyncCryptoCallbacks implementation
     //
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    /**
+     * Apply sync changes to the olm machine
+     * @param events - the received to-device messages
+     * @param oneTimeKeysCounts - the received one time key counts
+     * @param unusedFallbackKeys - the received unused fallback keys
+     * @returns A list of preprocessed to-device messages.
+     */
+    private async receiveSyncChanges({
+        events,
+        oneTimeKeysCounts = new Map<string, number>(),
+        unusedFallbackKeys = new Set<string>(),
+    }: {
+        events?: IToDeviceEvent[];
+        oneTimeKeysCounts?: Map<string, number>;
+        unusedFallbackKeys?: Set<string>;
+    }): Promise<IToDeviceEvent[]> {
+        const result = await this.olmMachine.receiveSyncChanges(
+            events ? JSON.stringify(events) : "[]",
+            new RustSdkCryptoJs.DeviceLists(),
+            oneTimeKeysCounts,
+            unusedFallbackKeys,
+        );
+
+        // receiveSyncChanges returns a JSON-encoded list of decrypted to-device messages.
+        return JSON.parse(result);
+    }
 
     /** called by the sync loop to preprocess incoming to-device messages
      *
      * @param events - the received to-device messages
      * @returns A list of preprocessed to-device messages.
      */
-    public async preprocessToDeviceMessages(events: IToDeviceEvent[]): Promise<IToDeviceEvent[]> {
+    public preprocessToDeviceMessages(events: IToDeviceEvent[]): Promise<IToDeviceEvent[]> {
         // send the received to-device messages into receiveSyncChanges. We have no info on device-list changes,
         // one-time-keys, or fallback keys, so just pass empty data.
-        const result = await this.olmMachine.receiveSyncChanges(
-            JSON.stringify(events),
-            new RustSdkCryptoJs.DeviceLists(),
-            new Map(),
-            new Set(),
-        );
+        return this.receiveSyncChanges({ events });
+    }
 
-        // receiveSyncChanges returns a JSON-encoded list of decrypted to-device messages.
-        return JSON.parse(result);
+    /** called by the sync loop to preprocess one time key counts
+     *
+     * @param oneTimeKeysCounts - the received one time key counts
+     * @returns A list of preprocessed to-device messages.
+     */
+    public async preprocessOneTimeKeyCounts(oneTimeKeysCounts: Map<string, number>): Promise<void> {
+        await this.receiveSyncChanges({ oneTimeKeysCounts });
+    }
+
+    /** called by the sync loop to preprocess unused fallback keys
+     *
+     * @param unusedFallbackKeys - the received unused fallback keys
+     * @returns A list of preprocessed to-device messages.
+     */
+    public async preprocessUnusedFallbackKeys(unusedFallbackKeys: Set<string>): Promise<void> {
+        await this.receiveSyncChanges({ unusedFallbackKeys });
     }
 
     /** called by the sync loop on m.room.encrypted events
@@ -204,7 +252,13 @@ export class RustCrypto implements CryptoBackend {
         if (existingEncryptor) {
             existingEncryptor.onCryptoEvent(config);
         } else {
-            this.roomEncryptors[room.roomId] = new RoomEncryptor(this.olmMachine, this.keyClaimManager, room, config);
+            this.roomEncryptors[room.roomId] = new RoomEncryptor(
+                this.olmMachine,
+                this.keyClaimManager,
+                this.outgoingRequestProcessor,
+                room,
+                config,
+            );
         }
 
         // start tracking devices for any users already known to be in this room.
