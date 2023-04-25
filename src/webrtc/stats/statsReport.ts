@@ -21,6 +21,7 @@ import { Resolution } from "./media/mediaTrackStats";
 export enum StatsReport {
     CONNECTION_STATS = "StatsReport.connection_stats",
     BYTE_SENT_STATS = "StatsReport.byte_sent_stats",
+    SUMMARY_STATS = "StatsReport.summary_stats",
 }
 
 export type TrackID = string;
@@ -37,6 +38,7 @@ export interface ConnectionStatsReport {
     resolution: ResolutionMap;
     framerate: FramerateMap;
     codec: CodecMap;
+    jitter: Map<TrackID, number>;
     transport: TransportStats[];
 }
 
@@ -53,4 +55,17 @@ export interface FramerateMap {
 export interface CodecMap {
     local: Map<TrackID, string>;
     remote: Map<TrackID, string>;
+}
+
+export interface SummaryStatsReport {
+    /**
+     * Aggregated the information for percentage of received media
+     *
+     * This measure whether the current user receive data from a call participants.
+     * As soon as a participant sends at least a byte media to this user, this counts as one measurement unit.
+     * The units of measure divided by the total number of participants is a value between 0 and 1.
+     */
+    percentageReceivedMedia: number;
+    percentageReceivedAudioMedia: number;
+    percentageReceivedVideoMedia: number;
 }

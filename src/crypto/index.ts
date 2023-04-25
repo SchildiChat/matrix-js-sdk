@@ -34,21 +34,8 @@ import type { DecryptionAlgorithm, EncryptionAlgorithm } from "./algorithms";
 import * as algorithms from "./algorithms";
 import { createCryptoStoreCacheCallbacks, CrossSigningInfo, DeviceTrustLevel, UserTrustLevel } from "./CrossSigning";
 import { EncryptionSetupBuilder } from "./EncryptionSetup";
-import {
-    IAccountDataClient,
-    ISecretRequest,
-    SECRET_STORAGE_ALGORITHM_V1_AES,
-    SecretStorage,
-    SecretStorageKeyObject,
-    SecretStorageKeyTuple,
-} from "./SecretStorage";
-import {
-    IAddSecretStorageKeyOpts,
-    ICreateSecretStorageOpts,
-    IEncryptedEventInfo,
-    IImportRoomKeysOpts,
-    IRecoveryKey,
-} from "./api";
+import { SecretStorage as LegacySecretStorage } from "./SecretStorage";
+import { ICreateSecretStorageOpts, IEncryptedEventInfo, IImportRoomKeysOpts, IRecoveryKey } from "./api";
 import { OutgoingRoomKeyRequestManager } from "./OutgoingRoomKeyRequestManager";
 import { IndexedDBCryptoStore } from "./store/indexeddb-crypto-store";
 import { VerificationBase } from "./verification/Base";
@@ -84,13 +71,23 @@ import { CryptoStore } from "./store/base";
 import { IVerificationChannel } from "./verification/request/Channel";
 import { TypedEventEmitter } from "../models/typed-event-emitter";
 import { IContent } from "../models/event";
-import { ISyncResponse, IToDeviceEvent } from "../sync-accumulator";
+import { IDeviceLists, ISyncResponse, IToDeviceEvent } from "../sync-accumulator";
 import { ISignatures } from "../@types/signed";
 import { IMessage } from "./algorithms/olm";
 import { CryptoBackend, OnSyncCompletedData } from "../common-crypto/CryptoBackend";
 import { RoomState, RoomStateEvent } from "../models/room-state";
 import { MapWithDefault, recursiveMapToObject } from "../utils";
-import { SecretStorageKeyDescription } from "../secret-storage";
+import {
+    AccountDataClient,
+    AddSecretStorageKeyOpts,
+    SecretStorageKeyDescription,
+    SecretStorageKeyObject,
+    SecretStorageKeyTuple,
+    SECRET_STORAGE_ALGORITHM_V1_AES,
+    SecretStorageCallbacks,
+    ServerSideSecretStorageImpl,
+} from "../secret-storage";
+import { ISecretRequest } from "./SecretSharing";
 
 const DeviceVerification = DeviceInfo.DeviceVerification;
 
@@ -137,14 +134,10 @@ export interface IBootstrapCrossSigningOpts {
     authUploadDeviceSigningKeys?(makeRequest: (authData: any) => Promise<{}>): Promise<void>;
 }
 
-export interface ICryptoCallbacks {
+export interface ICryptoCallbacks extends SecretStorageCallbacks {
     getCrossSigningKey?: (keyType: string, pubKey: string) => Promise<Uint8Array | null>;
     saveCrossSigningKeys?: (keys: Record<string, Uint8Array>) => void;
     shouldUpgradeDeviceVerifications?: (users: Record<string, any>) => Promise<string[]>;
-    getSecretStorageKey?: (
-        keys: { keys: Record<string, SecretStorageKeyDescription> },
-        name: string,
-    ) => Promise<[string, Uint8Array] | null>;
     cacheSecretStorageKey?: (keyId: string, keyInfo: SecretStorageKeyDescription, key: Uint8Array) => void;
     onSecretRequested?: (
         userId: string,
@@ -252,8 +245,8 @@ export enum CryptoEvent {
 export type CryptoEventHandlerMap = {
     /**
      * Fires when a device is marked as verified/unverified/blocked/unblocked by
-     * {@link MatrixClient#setDeviceVerified|MatrixClient.setDeviceVerified} or
-     * {@link MatrixClient#setDeviceBlocked|MatrixClient.setDeviceBlocked}.
+     * {@link MatrixClient#setDeviceVerified | MatrixClient.setDeviceVerified} or
+     * {@link MatrixClient#setDeviceBlocked | MatrixClient.setDeviceBlocked}.
      *
      * @param userId - the owner of the verified device
      * @param deviceId - the id of the verified device
@@ -356,7 +349,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
     public readonly olmDevice: OlmDevice;
     public readonly deviceList: DeviceList;
     public readonly dehydrationManager: DehydrationManager;
-    public readonly secretStorage: SecretStorage;
+    public readonly secretStorage: LegacySecretStorage;
 
     private readonly reEmitter: TypedReEmitter<CryptoEvent, CryptoEventHandlerMap>;
     private readonly verificationMethods: Map<VerificationMethod, typeof VerificationBase>;
@@ -483,15 +476,15 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
             }
 
             // try to get key from secret storage
-            const storedKey = await this.getSecret("m.megolm_backup.v1");
+            const storedKey = await this.secretStorage.get("m.megolm_backup.v1");
 
             if (storedKey) {
                 // ensure that the key is in the right format.  If not, fix the key and
                 // store the fixed version
                 const fixedKey = fixBackupKey(storedKey);
                 if (fixedKey) {
-                    const keys = await this.getSecretStorageKey();
-                    await this.storeSecret("m.megolm_backup.v1", fixedKey, [keys![0]]);
+                    const keys = await this.secretStorage.getKey();
+                    await this.secretStorage.store("m.megolm_backup.v1", fixedKey, [keys![0]]);
                 }
 
                 return olmlib.decodeBase64(fixedKey || storedKey);
@@ -529,7 +522,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
 
         this.crossSigningInfo = new CrossSigningInfo(userId, cryptoCallbacks, cacheCallbacks);
         // Yes, we pass the client twice here: see SecretStorage
-        this.secretStorage = new SecretStorage(baseApis as IAccountDataClient, cryptoCallbacks, baseApis);
+        this.secretStorage = new LegacySecretStorage(baseApis as AccountDataClient, cryptoCallbacks, baseApis);
         this.dehydrationManager = new DehydrationManager(this);
 
         // Assuming no app-supplied callback, default to getting from SSSS.
@@ -834,10 +827,9 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
         // done as part of setting up secret storage later.
         const crossSigningPrivateKeys = builder.crossSigningCallbacks.privateKeys;
         if (crossSigningPrivateKeys.size && !this.baseApis.cryptoCallbacks.saveCrossSigningKeys) {
-            const secretStorage = new SecretStorage(
+            const secretStorage = new ServerSideSecretStorageImpl(
                 builder.accountDataClientAdapter,
                 builder.ssssCryptoCallbacks,
-                undefined,
             );
             if (await secretStorage.hasKey()) {
                 logger.log("Storing new cross-signing private keys in secret storage");
@@ -900,17 +892,16 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
         logger.log("Bootstrapping Secure Secret Storage");
         const delegateCryptoCallbacks = this.baseApis.cryptoCallbacks;
         const builder = new EncryptionSetupBuilder(this.baseApis.store.accountData, delegateCryptoCallbacks);
-        const secretStorage = new SecretStorage(
+        const secretStorage = new ServerSideSecretStorageImpl(
             builder.accountDataClientAdapter,
             builder.ssssCryptoCallbacks,
-            undefined,
         );
 
         // the ID of the new SSSS key, if we create one
         let newKeyId: string | null = null;
 
         // create a new SSSS key and set it as default
-        const createSSSS = async (opts: IAddSecretStorageKeyOpts, privateKey?: Uint8Array): Promise<string> => {
+        const createSSSS = async (opts: AddSecretStorageKeyOpts, privateKey?: Uint8Array): Promise<string> => {
             if (privateKey) {
                 opts.key = privateKey;
             }
@@ -959,7 +950,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
             }
         };
 
-        const oldSSSSKey = await this.getSecretStorageKey();
+        const oldSSSSKey = await this.secretStorage.getKey();
         const [oldKeyId, oldKeyInfo] = oldSSSSKey || [null, null];
         const storageExists =
             !setupNewSecretStorage && oldKeyInfo && oldKeyInfo.algorithm === SECRET_STORAGE_ALGORITHM_V1_AES;
@@ -984,7 +975,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
             // secrets using it, in theory. We could move them to the new key but a)
             // that would mean we'd need to prompt for the old passphrase, and b)
             // it's not clear that would be the right thing to do anyway.
-            const { keyInfo = {} as IAddSecretStorageKeyOpts, privateKey } = await createSecretStorageKey();
+            const { keyInfo = {} as AddSecretStorageKeyOpts, privateKey } = await createSecretStorageKey();
             newKeyId = await createSSSS(keyInfo, privateKey);
         } else if (!storageExists && keyBackupInfo) {
             // we have an existing backup, but no SSSS
@@ -995,7 +986,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
             const backupKey = (await this.getSessionBackupPrivateKey()) || (await getKeyBackupPassphrase?.());
 
             // create a new SSSS key and use the backup key as the new SSSS key
-            const opts = {} as IAddSecretStorageKeyOpts;
+            const opts = {} as AddSecretStorageKeyOpts;
 
             if (keyBackupInfo.auth_data.private_key_salt && keyBackupInfo.auth_data.private_key_iterations) {
                 // FIXME: ???
@@ -1109,30 +1100,48 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
         logger.log("Secure Secret Storage ready");
     }
 
+    /**
+     * @deprecated Use {@link MatrixClient#secretStorage} and {@link SecretStorage.ServerSideSecretStorage#addKey}.
+     */
     public addSecretStorageKey(
         algorithm: string,
-        opts: IAddSecretStorageKeyOpts,
+        opts: AddSecretStorageKeyOpts,
         keyID?: string,
     ): Promise<SecretStorageKeyObject> {
         return this.secretStorage.addKey(algorithm, opts, keyID);
     }
 
+    /**
+     * @deprecated Use {@link MatrixClient#secretStorage} and {@link SecretStorage.ServerSideSecretStorage#hasKey}.
+     */
     public hasSecretStorageKey(keyID?: string): Promise<boolean> {
         return this.secretStorage.hasKey(keyID);
     }
 
+    /**
+     * @deprecated Use {@link MatrixClient#secretStorage} and {@link SecretStorage.ServerSideSecretStorage#getKey}.
+     */
     public getSecretStorageKey(keyID?: string): Promise<SecretStorageKeyTuple | null> {
         return this.secretStorage.getKey(keyID);
     }
 
+    /**
+     * @deprecated Use {@link MatrixClient#secretStorage} and {@link SecretStorage.ServerSideSecretStorage#store}.
+     */
     public storeSecret(name: string, secret: string, keys?: string[]): Promise<void> {
         return this.secretStorage.store(name, secret, keys);
     }
 
+    /**
+     * @deprecated Use {@link MatrixClient#secretStorage} and {@link SecretStorage.ServerSideSecretStorage#get}.
+     */
     public getSecret(name: string): Promise<string | undefined> {
         return this.secretStorage.get(name);
     }
 
+    /**
+     * @deprecated Use {@link MatrixClient#secretStorage} and {@link SecretStorage.ServerSideSecretStorage#isStored}.
+     */
     public isSecretStored(name: string): Promise<Record<string, SecretStorageKeyDescription> | null> {
         return this.secretStorage.isStored(name);
     }
@@ -1144,14 +1153,23 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
         return this.secretStorage.request(name, devices);
     }
 
+    /**
+     * @deprecated Use {@link MatrixClient#secretStorage} and {@link SecretStorage.ServerSideSecretStorage#getDefaultKeyId}.
+     */
     public getDefaultSecretStorageKeyId(): Promise<string | null> {
         return this.secretStorage.getDefaultKeyId();
     }
 
+    /**
+     * @deprecated Use {@link MatrixClient#secretStorage} and {@link SecretStorage.ServerSideSecretStorage#setDefaultKeyId}.
+     */
     public setDefaultSecretStorageKeyId(k: string): Promise<void> {
         return this.secretStorage.setDefaultKeyId(k);
     }
 
+    /**
+     * @deprecated Use {@link MatrixClient#secretStorage} and {@link SecretStorage.ServerSideSecretStorage#checkKey}.
+     */
     public checkSecretStorageKey(key: Uint8Array, info: SecretStorageKeyDescription): Promise<boolean> {
         return this.secretStorage.checkKey(key, info);
     }
@@ -1787,8 +1805,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
      *
      * @param value - whether to blacklist all unverified devices by default
      *
-     * @deprecated For external code, use {@link MatrixClient#setGlobalBlacklistUnverifiedDevices}. For
-     *   internal code, set {@link MatrixClient#globalBlacklistUnverifiedDevices} directly.
+     * @deprecated Set {@link CryptoApi#globalBlacklistUnverifiedDevices | CryptoApi.globalBlacklistUnverifiedDevices} directly.
      */
     public setGlobalBlacklistUnverifiedDevices(value: boolean): void {
         this.globalBlacklistUnverifiedDevices = value;
@@ -1797,8 +1814,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
     /**
      * @returns whether to blacklist all unverified devices by default
      *
-     * @deprecated For external code, use {@link MatrixClient#getGlobalBlacklistUnverifiedDevices}. For
-     *   internal code, reference {@link MatrixClient#globalBlacklistUnverifiedDevices} directly.
+     * @deprecated Reference {@link CryptoApi#globalBlacklistUnverifiedDevices | CryptoApi.globalBlacklistUnverifiedDevices} directly.
      */
     public getGlobalBlacklistUnverifiedDevices(): boolean {
         return this.globalBlacklistUnverifiedDevices;
@@ -1821,24 +1837,6 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
                 device_keys: deviceKeys as Required<IDeviceKeys>,
             });
         });
-    }
-
-    /**
-     * Stores the current one_time_key count which will be handled later (in a call of
-     * onSyncCompleted). The count is e.g. coming from a /sync response.
-     *
-     * @param currentCount - The current count of one_time_keys to be stored
-     */
-    public updateOneTimeKeyCount(currentCount: number): void {
-        if (isFinite(currentCount)) {
-            this.oneTimeKeyCount = currentCount;
-        } else {
-            throw new TypeError("Parameter for updateOneTimeKeyCount has to be a number");
-        }
-    }
-
-    public setNeedsNewFallback(needsNewFallback: boolean): void {
-        this.needsNewFallback = needsNewFallback;
     }
 
     public getNeedsNewFallback(): boolean {
@@ -1976,7 +1974,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
                 fallbackJson["signed_curve25519:" + keyId] = k;
                 promises.push(this.signObject(k));
             }
-            this.setNeedsNewFallback(false);
+            this.needsNewFallback = false;
         }
 
         const oneTimeKeys = await this.olmDevice.getOneTimeKeys();
@@ -2693,7 +2691,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
      *
      * @returns resolves once the sessions are complete, to
      *    an Object mapping from userId to deviceId to
-     *    {@link OlmSessionResult}
+     *    `IOlmSessionResult`
      */
     public ensureOlmSessionsForUsers(
         users: string[],
@@ -2917,21 +2915,12 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
     }
 
     /**
-     * Handle the notification from /sync or /keys/changes that device lists have
+     * Handle the notification from /sync that device lists have
      * been changed.
      *
-     * @param syncData - Object containing sync tokens associated with this sync
-     * @param syncDeviceLists - device_lists field from /sync, or response from
-     * /keys/changes
+     * @param deviceLists - device_lists field from /sync
      */
-    public async handleDeviceListChanges(
-        syncData: ISyncStateData,
-        syncDeviceLists: Required<ISyncResponse>["device_lists"],
-    ): Promise<void> {
-        // Initial syncs don't have device change lists. We'll either get the complete list
-        // of changes for the interval or will have invalidated everything in willProcessSync
-        if (!syncData.oldSyncToken) return;
-
+    public async processDeviceLists(deviceLists: IDeviceLists): Promise<void> {
         // Here, we're relying on the fact that we only ever save the sync data after
         // sucessfully saving the device list data, so we're guaranteed that the device
         // list store is at least as fresh as the sync token from the sync store, ie.
@@ -2940,7 +2929,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
         // If we didn't make this assumption, we'd have to use the /keys/changes API
         // to get key changes between the sync token in the device list and the 'old'
         // sync token used here to make sure we didn't miss any.
-        await this.evalDeviceListChanges(syncDeviceLists);
+        await this.evalDeviceListChanges(deviceLists);
     }
 
     /**
@@ -3221,14 +3210,33 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
         });
     }
 
-    public preprocessOneTimeKeyCounts(oneTimeKeysCounts: Map<string, number>): Promise<void> {
-        const currentCount = oneTimeKeysCounts.get("signed_curve25519") || 0;
-        this.updateOneTimeKeyCount(currentCount);
-        return Promise.resolve();
+    /**
+     * Stores the current one_time_key count which will be handled later (in a call of
+     * onSyncCompleted).
+     *
+     * @param currentCount - The current count of one_time_keys to be stored
+     */
+    private updateOneTimeKeyCount(currentCount: number): void {
+        if (isFinite(currentCount)) {
+            this.oneTimeKeyCount = currentCount;
+        } else {
+            throw new TypeError("Parameter for updateOneTimeKeyCount has to be a number");
+        }
     }
 
-    public preprocessUnusedFallbackKeys(unusedFallbackKeys: Set<string>): Promise<void> {
-        this.setNeedsNewFallback(!unusedFallbackKeys.has("signed_curve25519"));
+    public processKeyCounts(oneTimeKeysCounts?: Record<string, number>, unusedFallbackKeys?: string[]): Promise<void> {
+        if (oneTimeKeysCounts !== undefined) {
+            this.updateOneTimeKeyCount(oneTimeKeysCounts["signed_curve25519"] || 0);
+        }
+
+        if (unusedFallbackKeys !== undefined) {
+            // If `unusedFallbackKeys` is defined, that means `device_unused_fallback_key_types`
+            // is present in the sync response, which indicates that the server supports fallback keys.
+            //
+            // If there's no unused signed_curve25519 fallback key, we need a new one.
+            this.needsNewFallback = !unusedFallbackKeys.includes("signed_curve25519");
+        }
+
         return Promise.resolve();
     }
 
@@ -3784,7 +3792,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
      *
      * @param algorithm -  crypto algorithm
      *
-     * @throws {@link DecryptionError} if the algorithm is unknown
+     * @throws `DecryptionError` if the algorithm is unknown
      */
     public getRoomDecryptor(roomId: string | null, algorithm: string): DecryptionAlgorithm {
         let decryptors: Map<string, DecryptionAlgorithm> | undefined;

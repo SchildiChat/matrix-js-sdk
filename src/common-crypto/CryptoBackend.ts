@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import type { IToDeviceEvent } from "../sync-accumulator";
+import type { IDeviceLists, IToDeviceEvent } from "../sync-accumulator";
 import { MatrixEvent } from "../models/event";
 import { Room } from "../models/room";
 import { CryptoApi } from "../crypto-api";
@@ -106,32 +106,20 @@ export interface SyncCryptoCallbacks {
     preprocessToDeviceMessages(events: IToDeviceEvent[]): Promise<IToDeviceEvent[]>;
 
     /**
-     * Called by the /sync loop whenever there are incoming to-device messages.
-     *
-     * The implementation may preprocess the received messages (eg, decrypt them) and return an
-     * updated list of messages for dispatch to the rest of the system.
-     *
-     * Note that, unlike {@link ClientEvent.ToDeviceEvent} events, this is called on the raw to-device
-     * messages, rather than the results of any decryption attempts.
+     * Called by the /sync loop when one time key counts and unused fallback key details are received.
      *
      * @param oneTimeKeysCounts - the received one time key counts
-     * @returns A list of preprocessed to-device messages.
+     * @param unusedFallbackKeys - the received unused fallback keys
      */
-    preprocessOneTimeKeyCounts(oneTimeKeysCounts: Map<string, number>): Promise<void>;
+    processKeyCounts(oneTimeKeysCounts?: Record<string, number>, unusedFallbackKeys?: string[]): Promise<void>;
 
     /**
-     * Called by the /sync loop whenever there are incoming to-device messages.
+     * Handle the notification from /sync that device lists have
+     * been changed.
      *
-     * The implementation may preprocess the received messages (eg, decrypt them) and return an
-     * updated list of messages for dispatch to the rest of the system.
-     *
-     * Note that, unlike {@link ClientEvent.ToDeviceEvent} events, this is called on the raw to-device
-     * messages, rather than the results of any decryption attempts.
-     *
-     * @param unusedFallbackKeys - the received unused fallback keys
-     * @returns A list of preprocessed to-device messages.
+     * @param deviceLists - device_lists field from /sync
      */
-    preprocessUnusedFallbackKeys(unusedFallbackKeys: Set<string>): Promise<void>;
+    processDeviceLists(deviceLists: IDeviceLists): Promise<void>;
 
     /**
      * Called by the /sync loop whenever an m.room.encryption event is received.

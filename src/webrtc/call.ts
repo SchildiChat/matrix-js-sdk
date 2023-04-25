@@ -152,6 +152,10 @@ export enum CallEvent {
     DataChannel = "datachannel",
 
     SendVoipEvent = "send_voip_event",
+
+    // When the call instantiates its peer connection
+    // For apps that want to access the underlying peer connection, eg for debugging
+    PeerConnectionCreated = "peer_connection_created",
 }
 
 export enum CallErrorCode {
@@ -325,6 +329,7 @@ export type CallEventHandlerMap = {
     /* @deprecated */
     [CallEvent.HoldUnhold]: (onHold: boolean) => void;
     [CallEvent.SendVoipEvent]: (event: VoipEvent, call: MatrixCall) => void;
+    [CallEvent.PeerConnectionCreated]: (peerConn: RTCPeerConnection, call: MatrixCall) => void;
 };
 
 // The key of the transceiver map (purpose + media type, separated by ':')
@@ -951,6 +956,7 @@ export class MatrixCall extends TypedEventEmitter<CallEvent, CallEventHandlerMap
         }
 
         this.peerConn = this.createPeerConnection();
+        this.emit(CallEvent.PeerConnectionCreated, this.peerConn, this);
         // we must set the party ID before await-ing on anything: the call event
         // handler will start giving us more call events (eg. candidates) so if
         // we haven't set the party ID, we'll ignore them.
@@ -2309,7 +2315,7 @@ export class MatrixCall extends TypedEventEmitter<CallEvent, CallEventHandlerMap
      *       [96685:23:0518/162603.933430:ERROR:sdp_offer_answer.cc(4302)] Failed to set local video description recv parameters for m-section with mid='2'. (INVALID_PARAMETER)
      */
     private getRidOfRTXCodecs(): void {
-        // RTCRtpReceiver.getCapabilities and RTCRtpSender.getCapabilities don't seem to be supported on FF
+        // RTCRtpReceiver.getCapabilities and RTCRtpSender.getCapabilities don't seem to be supported on FF before v113
         if (!RTCRtpReceiver.getCapabilities || !RTCRtpSender.getCapabilities) return;
 
         const recvCodecs = RTCRtpReceiver.getCapabilities("video")!.codecs;
@@ -2326,7 +2332,8 @@ export class MatrixCall extends TypedEventEmitter<CallEvent, CallEventHandlerMap
         const screenshareVideoTransceiver = this.transceivers.get(
             getTransceiverKey(SDPStreamMetadataPurpose.Screenshare, "video"),
         );
-        if (screenshareVideoTransceiver) screenshareVideoTransceiver.setCodecPreferences(codecs);
+        // setCodecPreferences isn't supported on FF (as of v113)
+        screenshareVideoTransceiver?.setCodecPreferences?.(codecs);
     }
 
     private onNegotiationNeeded = async (): Promise<void> => {
@@ -2785,6 +2792,7 @@ export class MatrixCall extends TypedEventEmitter<CallEvent, CallEventHandlerMap
         // create the peer connection now so it can be gathering candidates while we get user
         // media (assuming a candidate pool size is configured)
         this.peerConn = this.createPeerConnection();
+        this.emit(CallEvent.PeerConnectionCreated, this.peerConn, this);
         this.gotCallFeedsForInvite(callFeeds, requestScreenshareFeed);
     }
 

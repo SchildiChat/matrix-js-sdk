@@ -64,7 +64,7 @@ import {
 import { IStateEventWithRoomId } from "../@types/search";
 import { RelationsContainer } from "./relations-container";
 import { ReadReceipt, synthesizeReceipt } from "./read-receipt";
-import { Poll, PollEvent } from "./poll";
+import { isPollEvent, Poll, PollEvent } from "./poll";
 
 // These constants are used as sane defaults when the homeserver doesn't support
 // the m.room_versions capability. In practice, KNOWN_SAFE_ROOM_VERSION should be
@@ -324,7 +324,14 @@ export class Room extends ReadReceipt<RoomEmittedEvents, RoomEventHandlerMap> {
     private unthreadedReceipts = new Map<string, Receipt>();
     private readonly timelineSets: EventTimelineSet[];
     public readonly polls: Map<string, Poll> = new Map<string, Poll>();
-    public readonly threadsTimelineSets: EventTimelineSet[] = [];
+
+    /**
+     * Empty array if the timeline sets have not been initialised. After initialisation:
+     * 0: All threads
+     * 1: Threads the current user has participated in
+     */
+    public readonly threadsTimelineSets: [] | [EventTimelineSet, EventTimelineSet] = [];
+
     // any filtered timeline sets we're maintaining for this room
     private readonly filteredTimelineSets: Record<string, EventTimelineSet> = {}; // filter_id: timelineSet
     private timelineNeedsRefresh = false;
@@ -490,7 +497,8 @@ export class Room extends ReadReceipt<RoomEmittedEvents, RoomEventHandlerMap> {
                     this.createThreadTimelineSet(ThreadFilterType.My),
                 ]);
                 const timelineSets = await this.threadTimelineSetsPromise;
-                this.threadsTimelineSets.push(...timelineSets);
+                this.threadsTimelineSets[0] = timelineSets[0];
+                this.threadsTimelineSets[1] = timelineSets[1];
                 return timelineSets;
             } catch (e) {
                 this.threadTimelineSetsPromise = null;
@@ -1897,35 +1905,62 @@ export class Room extends ReadReceipt<RoomEmittedEvents, RoomEventHandlerMap> {
         this.threadsReady = true;
     }
 
+    /**
+     * Calls {@link processPollEvent} for a list of events.
+     *
+     * @param events - List of events
+     */
     public async processPollEvents(events: MatrixEvent[]): Promise<void> {
-        const processPollStartEvent = (event: MatrixEvent): void => {
-            if (!M_POLL_START.matches(event.getType())) return;
+        for (const event of events) {
+            try {
+                // Continue if the event is a clear text, non-poll event.
+                if (!event.isEncrypted() && !isPollEvent(event)) continue;
+
+                /**
+                 * Try to decrypt the event. Promise resolution does not guarantee a successful decryption.
+                 * Retry is handled in {@link processPollEvent}.
+                 */
+                await this.client.decryptEventIfNeeded(event);
+                this.processPollEvent(event);
+            } catch (err) {
+                logger.warn("Error processing poll event", event.getId(), err);
+            }
+        }
+    }
+
+    /**
+     * Processes poll events:
+     * If the event has a decryption failure, it will listen for decryption and tries again.
+     * If it is a poll start event (`m.poll.start`),
+     * it creates and stores a Poll model and emits a PollEvent.New event.
+     * If the event is related to a poll, it will add it to the poll.
+     * Noop for other cases.
+     *
+     * @param event - Event that could be a poll event
+     */
+    private async processPollEvent(event: MatrixEvent): Promise<void> {
+        if (event.isDecryptionFailure()) {
+            event.once(MatrixEventEvent.Decrypted, (maybeDecryptedEvent: MatrixEvent) => {
+                this.processPollEvent(maybeDecryptedEvent);
+            });
+            return;
+        }
+
+        if (M_POLL_START.matches(event.getType())) {
             try {
                 const poll = new Poll(event, this.client, this);
                 this.polls.set(event.getId()!, poll);
                 this.emit(PollEvent.New, poll);
             } catch {}
             // poll creation can fail for malformed poll start events
-        };
+            return;
+        }
 
-        const processPollRelationEvent = (event: MatrixEvent): void => {
-            const relationEventId = event.relationEventId;
-            if (relationEventId && this.polls.has(relationEventId)) {
-                const poll = this.polls.get(relationEventId);
-                poll?.onNewRelation(event);
-            }
-        };
+        const relationEventId = event.relationEventId;
 
-        const processPollEvent = (event: MatrixEvent): void => {
-            processPollStartEvent(event);
-            processPollRelationEvent(event);
-        };
-
-        for (const event of events) {
-            try {
-                await this.client.decryptEventIfNeeded(event);
-                processPollEvent(event);
-            } catch {}
+        if (relationEventId && this.polls.has(relationEventId)) {
+            const poll = this.polls.get(relationEventId);
+            poll?.onNewRelation(event);
         }
     }
 
@@ -1934,6 +1969,8 @@ export class Room extends ReadReceipt<RoomEmittedEvents, RoomEventHandlerMap> {
      * @internal
      */
     private async fetchRoomThreadList(filter?: ThreadFilterType): Promise<void> {
+        if (this.threadsTimelineSets.length === 0) return;
+
         const timelineSet = filter === ThreadFilterType.My ? this.threadsTimelineSets[1] : this.threadsTimelineSets[0];
 
         const { chunk: events, end } = await this.client.createThreadListMessagesRequest(

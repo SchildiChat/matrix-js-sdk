@@ -953,7 +953,7 @@ export class SyncApi {
                 }
 
                 // tell databases that everything is now in a consistent state and can be saved.
-                this.client.store.save();
+                await this.client.store.save();
             }
         }
 
@@ -1515,8 +1515,8 @@ export class SyncApi {
 
         // Handle device list updates
         if (data.device_lists) {
-            if (this.syncOpts.crypto) {
-                await this.syncOpts.crypto.handleDeviceListChanges(syncEventData, data.device_lists);
+            if (this.syncOpts.cryptoCallbacks) {
+                await this.syncOpts.cryptoCallbacks.processDeviceLists(data.device_lists);
             } else {
                 // FIXME if we *don't* have a crypto module, we still need to
                 // invalidate the device lists. But that would require a
@@ -1524,19 +1524,11 @@ export class SyncApi {
             }
         }
 
-        // Handle one_time_keys_count
-        if (data.device_one_time_keys_count) {
-            const map = new Map<string, number>(Object.entries(data.device_one_time_keys_count));
-            this.syncOpts.cryptoCallbacks?.preprocessOneTimeKeyCounts(map);
-        }
-        if (data.device_unused_fallback_key_types || data["org.matrix.msc2732.device_unused_fallback_key_types"]) {
-            // The presence of device_unused_fallback_key_types indicates that the
-            // server supports fallback keys. If there's no unused
-            // signed_curve25519 fallback key we need a new one.
-            const unusedFallbackKeys =
-                data.device_unused_fallback_key_types || data["org.matrix.msc2732.device_unused_fallback_key_types"];
-            this.syncOpts.cryptoCallbacks?.preprocessUnusedFallbackKeys(new Set<string>(unusedFallbackKeys || null));
-        }
+        // Handle one_time_keys_count and unused fallback keys
+        this.syncOpts.cryptoCallbacks?.processKeyCounts(
+            data.device_one_time_keys_count,
+            data.device_unused_fallback_key_types ?? data["org.matrix.msc2732.device_unused_fallback_key_types"],
+        );
     }
 
     /**
