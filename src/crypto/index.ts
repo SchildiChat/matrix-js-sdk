@@ -88,6 +88,9 @@ import {
     ServerSideSecretStorageImpl,
 } from "../secret-storage";
 import { ISecretRequest } from "./SecretSharing";
+import { DeviceVerificationStatus } from "../crypto-api";
+import { Device, DeviceMap } from "../models/device";
+import { deviceInfoToDevice } from "./device-converter";
 
 const DeviceVerification = DeviceInfo.DeviceVerification;
 
@@ -605,18 +608,23 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
      *
      * @returns True if trusting cross-signed devices
      */
+    public getTrustCrossSignedDevices(): boolean {
+        return this.trustCrossSignedDevices;
+    }
+
+    /**
+     * @deprecated Use {@link CryptoApi#getTrustCrossSignedDevices}.
+     */
     public getCryptoTrustCrossSignedDevices(): boolean {
         return this.trustCrossSignedDevices;
     }
 
     /**
      * See getCryptoTrustCrossSignedDevices
-
-     * This may be set before initCrypto() is called to ensure no races occur.
      *
      * @param val - True to trust cross-signed devices
      */
-    public setCryptoTrustCrossSignedDevices(val: boolean): void {
+    public setTrustCrossSignedDevices(val: boolean): void {
         this.trustCrossSignedDevices = val;
 
         for (const userId of this.deviceList.getKnownUserIds()) {
@@ -632,6 +640,13 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
                 }
             }
         }
+    }
+
+    /**
+     * @deprecated Use {@link CryptoApi#setTrustCrossSignedDevices}.
+     */
+    public setCryptoTrustCrossSignedDevices(val: boolean): void {
+        this.setTrustCrossSignedDevices(val);
     }
 
     /**
@@ -1440,10 +1455,22 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
     /**
      * Check whether a given device is trusted.
      *
-     * @param userId - The ID of the user whose devices is to be checked.
+     * @param userId - The ID of the user whose device is to be checked.
      * @param deviceId - The ID of the device to check
-     *
-     * @returns
+     */
+    public async getDeviceVerificationStatus(
+        userId: string,
+        deviceId: string,
+    ): Promise<DeviceVerificationStatus | null> {
+        const device = this.deviceList.getStoredDevice(userId, deviceId);
+        if (!device) {
+            return null;
+        }
+        return this.checkDeviceInfoTrust(userId, device);
+    }
+
+    /**
+     * @deprecated Use {@link CryptoApi.getDeviceVerificationStatus}.
      */
     public checkDeviceTrust(userId: string, deviceId: string): DeviceTrustLevel {
         const device = this.deviceList.getStoredDevice(userId, deviceId);
@@ -1456,7 +1483,7 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
      * @param userId - The ID of the user whose devices is to be checked.
      * @param device - The device info object to check
      *
-     * @returns
+     * @deprecated Use {@link CryptoApi.getDeviceVerificationStatus}.
      */
     public checkDeviceInfoTrust(userId: string, device?: DeviceInfo): DeviceTrustLevel {
         const trustedLocally = !!device?.isVerified();
@@ -2036,6 +2063,54 @@ export class Crypto extends TypedEventEmitter<CryptoEvent, CryptoEventHandlerMap
      */
     public getStoredDevicesForUser(userId: string): Array<DeviceInfo> | null {
         return this.deviceList.getStoredDevicesForUser(userId);
+    }
+
+    /**
+     * Get the device information for the given list of users.
+     *
+     * @param userIds - The users to fetch.
+     * @param downloadUncached - If true, download the device list for users whose device list we are not
+     *    currently tracking. Defaults to false, in which case such users will not appear at all in the result map.
+     *
+     * @returns A map `{@link DeviceMap}`.
+     */
+    public async getUserDeviceInfo(userIds: string[], downloadUncached = false): Promise<DeviceMap> {
+        const deviceMapByUserId = new Map<string, Map<string, Device>>();
+        // Keep the users without device to download theirs keys
+        const usersWithoutDeviceInfo: string[] = [];
+
+        for (const userId of userIds) {
+            const deviceInfos = await this.getStoredDevicesForUser(userId);
+            // If there are device infos for a userId, we transform it into a map
+            // Else, the keys will be downloaded after
+            if (deviceInfos) {
+                const deviceMap = new Map(
+                    // Convert DeviceInfo to Device
+                    deviceInfos.map((deviceInfo) => [deviceInfo.deviceId, deviceInfoToDevice(deviceInfo, userId)]),
+                );
+                deviceMapByUserId.set(userId, deviceMap);
+            } else {
+                usersWithoutDeviceInfo.push(userId);
+            }
+        }
+
+        // Download device info for users without device infos
+        if (downloadUncached && usersWithoutDeviceInfo.length > 0) {
+            const newDeviceInfoMap = await this.downloadKeys(usersWithoutDeviceInfo);
+
+            newDeviceInfoMap.forEach((deviceInfoMap, userId) => {
+                const deviceMap = new Map<string, Device>();
+                // Convert DeviceInfo to Device
+                deviceInfoMap.forEach((deviceInfo, deviceId) =>
+                    deviceMap.set(deviceId, deviceInfoToDevice(deviceInfo, userId)),
+                );
+
+                // Put the new device infos into the returned map
+                deviceMapByUserId.set(userId, deviceMap);
+            });
+        }
+
+        return deviceMapByUserId;
     }
 
     /**

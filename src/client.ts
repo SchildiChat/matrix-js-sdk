@@ -715,7 +715,7 @@ interface IJoinedMembersResponse {
 }
 
 export interface IRegisterRequestParams {
-    auth?: IAuthData;
+    auth?: IAuthDict;
     username?: string;
     password?: string;
     refresh_token?: boolean;
@@ -2434,10 +2434,10 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      * @returns the VerificationRequest that is in progress, if any
      */
     public findVerificationRequestDMInProgress(roomId: string): VerificationRequest | undefined {
-        if (!this.crypto) {
+        if (!this.cryptoBackend) {
             throw new Error("End-to-end encryption disabled");
         }
-        return this.crypto.findVerificationRequestDMInProgress(roomId);
+        return this.cryptoBackend.findVerificationRequestDMInProgress(roomId);
     }
 
     /**
@@ -2594,10 +2594,10 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      * @returns the cross signing information for the user.
      */
     public getStoredCrossSigningForUser(userId: string): CrossSigningInfo | null {
-        if (!this.crypto) {
+        if (!this.cryptoBackend) {
             throw new Error("End-to-end encryption disabled");
         }
-        return this.crypto.getStoredCrossSigningForUser(userId);
+        return this.cryptoBackend.getStoredCrossSigningForUser(userId);
     }
 
     /**
@@ -2621,12 +2621,14 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      *
      * @param userId - The ID of the user whose devices is to be checked.
      * @param deviceId - The ID of the device to check
+     *
+     * @deprecated Use {@link CryptoApi.getDeviceVerificationStatus | `CryptoApi.getDeviceVerificationStatus`}
      */
     public checkDeviceTrust(userId: string, deviceId: string): DeviceTrustLevel {
-        if (!this.cryptoBackend) {
+        if (!this.crypto) {
             throw new Error("End-to-end encryption disabled");
         }
-        return this.cryptoBackend.checkDeviceTrust(userId, deviceId);
+        return this.crypto.checkDeviceTrust(userId, deviceId);
     }
 
     /**
@@ -2764,24 +2766,28 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      * Default: true
      *
      * @returns True if trusting cross-signed devices
+     *
+     * @deprecated Prefer {@link CryptoApi.getTrustCrossSignedDevices | `CryptoApi.getTrustCrossSignedDevices`}.
      */
     public getCryptoTrustCrossSignedDevices(): boolean {
-        if (!this.crypto) {
+        if (!this.cryptoBackend) {
             throw new Error("End-to-end encryption disabled");
         }
-        return this.crypto.getCryptoTrustCrossSignedDevices();
+        return this.cryptoBackend.getTrustCrossSignedDevices();
     }
 
     /**
      * See getCryptoTrustCrossSignedDevices
      *
      * @param val - True to trust cross-signed devices
+     *
+     * @deprecated Prefer {@link CryptoApi.setTrustCrossSignedDevices | `CryptoApi.setTrustCrossSignedDevices`}.
      */
     public setCryptoTrustCrossSignedDevices(val: boolean): void {
-        if (!this.crypto) {
+        if (!this.cryptoBackend) {
             throw new Error("End-to-end encryption disabled");
         }
-        this.crypto.setCryptoTrustCrossSignedDevices(val);
+        this.cryptoBackend.setTrustCrossSignedDevices(val);
     }
 
     /**
@@ -5730,6 +5736,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             return undefined;
         }
 
+        const recurse = this.canSupport.get(Feature.RelationsRecursion) !== ServerSupport.Unsupported;
         if (Thread.hasServerSideSupport) {
             if (Thread.hasServerSideFwdPaginationSupport) {
                 if (!timelineSet.thread) {
@@ -5742,14 +5749,14 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                     thread.id,
                     THREAD_RELATION_TYPE.name,
                     null,
-                    { dir: Direction.Backward, from: res.start },
+                    { dir: Direction.Backward, from: res.start, recurse: recurse || undefined },
                 );
                 const resNewer: IRelationsResponse = await this.fetchRelations(
                     timelineSet.room.roomId,
                     thread.id,
                     THREAD_RELATION_TYPE.name,
                     null,
-                    { dir: Direction.Forward, from: res.end },
+                    { dir: Direction.Forward, from: res.end, recurse: recurse || undefined },
                 );
                 const events = [
                     // Order events from most recent to oldest (reverse-chronological).
@@ -5797,7 +5804,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                     thread.id,
                     THREAD_RELATION_TYPE.name,
                     null,
-                    { dir: Direction.Backward, from: res.start },
+                    { dir: Direction.Backward, from: res.start, recurse: recurse || undefined },
                 );
                 const eventsNewer: IEvent[] = [];
                 let nextBatch: Optional<string> = res.end;
@@ -5807,7 +5814,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                         thread.id,
                         THREAD_RELATION_TYPE.name,
                         null,
-                        { dir: Direction.Forward, from: nextBatch },
+                        { dir: Direction.Forward, from: nextBatch, recurse: recurse || undefined },
                     );
                     nextBatch = resNewer.next_batch ?? null;
                     eventsNewer.push(...resNewer.chunk);
@@ -5878,12 +5885,13 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
             );
             event = res.chunk?.[0];
         } else if (timelineSet.thread && Thread.hasServerSideSupport) {
+            const recurse = this.canSupport.get(Feature.RelationsRecursion) !== ServerSupport.Unsupported;
             const res = await this.fetchRelations(
                 timelineSet.room.roomId,
                 timelineSet.thread.id,
                 THREAD_RELATION_TYPE.name,
                 null,
-                { dir: Direction.Backward, limit: 1 },
+                { dir: Direction.Backward, limit: 1, recurse: recurse || undefined },
             );
             event = res.chunk?.[0];
         } else {
@@ -6158,10 +6166,12 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
                 throw new Error("Unknown room " + eventTimeline.getRoomId());
             }
 
+            const recurse = this.canSupport.get(Feature.RelationsRecursion) !== ServerSupport.Unsupported;
             promise = this.fetchRelations(eventTimeline.getRoomId() ?? "", thread.id, THREAD_RELATION_TYPE.name, null, {
                 dir,
                 limit: opts.limit,
                 from: token ?? undefined,
+                recurse: recurse || undefined,
             })
                 .then(async (res) => {
                     const mapper = this.getEventMapper();
@@ -7851,7 +7861,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      * @returns Promise which resolves: On success, the token response
      * or UIA auth data.
      */
-    public async requestLoginToken(auth?: IAuthData): Promise<UIAResponse<LoginTokenPostResponse>> {
+    public async requestLoginToken(auth?: IAuthDict): Promise<UIAResponse<LoginTokenPostResponse>> {
         // use capabilities to determine which revision of the MSC is being used
         const capabilities = await this.getCapabilities();
         // use r1 endpoint if capability is exposed otherwise use old r0 endpoint
@@ -7949,6 +7959,9 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         let params = opts as QueryDict;
         if (Thread.hasServerSideFwdPaginationSupport === FeatureSupport.Experimental) {
             params = replaceParam("dir", "org.matrix.msc3715.dir", params);
+        }
+        if (this.canSupport.get(Feature.RelationsRecursion) === ServerSupport.Unstable) {
+            params = replaceParam("recurse", "org.matrix.msc3981.recurse", params);
         }
         const queryString = utils.encodeParams(params);
 
@@ -8230,7 +8243,6 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      */
     public getRoomIdForAlias(alias: string): Promise<{ room_id: string; servers: string[] }> {
         // eslint-disable-line camelcase
-        // TODO: deprecate this or resolveRoomAlias
         const path = utils.encodeUri("/directory/room/$alias", {
             $alias: alias,
         });
@@ -8240,10 +8252,10 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
     /**
      * @returns Promise which resolves: Object with room_id and servers.
      * @returns Rejects: with an error response.
+     * @deprecated use `getRoomIdForAlias` instead
      */
     // eslint-disable-next-line camelcase
     public resolveRoomAlias(roomAlias: string): Promise<{ room_id: string; servers: string[] }> {
-        // TODO: deprecate this or getRoomIdForAlias
         const path = utils.encodeUri("/directory/room/$alias", { $alias: roomAlias });
         return this.http.request(Method.Get, path);
     }
@@ -8616,6 +8628,23 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
     }
 
     /**
+     * Removes an existing pusher
+     * @param pushKey - pushkey of pusher to remove
+     * @param appId - app_id of pusher to remove
+     * @returns Promise which resolves: Empty json object on success
+     * @returns Rejects: with an error response.
+     */
+    public removePusher(pushKey: string, appId: string): Promise<{}> {
+        const path = "/pushers/set";
+        const body = {
+            pushkey: pushKey,
+            app_id: appId,
+            kind: null, // marks pusher for removal
+        };
+        return this.http.authedRequest(Method.Post, path, undefined, body);
+    }
+
+    /**
      * Persists local notification settings
      * @returns Promise which resolves: an empty object
      * @returns Rejects: with an error response.
@@ -8837,7 +8866,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         return this.http.authedRequest(Method.Get, "/keys/changes", qps);
     }
 
-    public uploadDeviceSigningKeys(auth?: IAuthData, keys?: CrossSigningKeys): Promise<{}> {
+    public uploadDeviceSigningKeys(auth?: IAuthDict, keys?: CrossSigningKeys): Promise<{}> {
         // API returns empty object
         const data = Object.assign({}, keys);
         if (auth) Object.assign(data, { auth });
@@ -8986,7 +9015,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      * @param identityAccessToken - The `access_token` field of the Identity
      * Server `/account/register` response (see {@link registerWithIdentityServer}).
      *
-     * @returns Promise which resolves: Object, currently with no parameters.
+     * @returns Promise which resolves: Object, containing success boolean.
      * @returns Rejects: with an error response.
      * @throws Error if No identity server is set
      */
@@ -8995,8 +9024,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         clientSecret: string,
         msisdnToken: string,
         identityAccessToken: string,
-    ): Promise<any> {
-        // TODO: Types
+    ): Promise<{ success: boolean }> {
         const params = {
             sid: sid,
             client_secret: clientSecret,
@@ -9027,7 +9055,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
      *                 This must be the same value submitted in the requestToken call.
      * @param msisdnToken - The MSISDN token, as enetered by the user.
      *
-     * @returns Promise which resolves: Object, currently with no parameters.
+     * @returns Promise which resolves: Object, containing success boolean.
      * @returns Rejects: with an error response.
      */
     public submitMsisdnTokenOtherUrl(
@@ -9035,8 +9063,7 @@ export class MatrixClient extends TypedEventEmitter<EmittedEvents, ClientEventHa
         sid: string,
         clientSecret: string,
         msisdnToken: string,
-    ): Promise<any> {
-        // TODO: Types
+    ): Promise<{ success: boolean }> {
         const params = {
             sid: sid,
             client_secret: clientSecret,

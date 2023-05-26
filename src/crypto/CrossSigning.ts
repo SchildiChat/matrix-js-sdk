@@ -31,6 +31,7 @@ import { ICryptoCallbacks } from ".";
 import { ISignatures } from "../@types/signed";
 import { CryptoStore, SecretStorePrivateKeys } from "./store/base";
 import { ServerSideSecretStorage, SecretStorageKeyDescription } from "../secret-storage";
+import { DeviceVerificationStatus } from "../crypto-api";
 
 const KEY_REQUEST_TIMEOUT_MS = 1000 * 60;
 
@@ -628,15 +629,20 @@ export class UserTrustLevel {
 }
 
 /**
- * Represents the ways in which we trust a device
+ * Represents the ways in which we trust a device.
+ *
+ * @deprecated Use {@link DeviceVerificationStatus}.
  */
-export class DeviceTrustLevel {
+export class DeviceTrustLevel extends DeviceVerificationStatus {
     public constructor(
-        public readonly crossSigningVerified: boolean,
-        public readonly tofu: boolean,
-        private readonly localVerified: boolean,
-        private readonly trustCrossSignedDevices: boolean,
-    ) {}
+        crossSigningVerified: boolean,
+        tofu: boolean,
+        localVerified: boolean,
+        trustCrossSignedDevices: boolean,
+        signedByOwner = false,
+    ) {
+        super({ crossSigningVerified, tofu, localVerified, trustCrossSignedDevices, signedByOwner });
+    }
 
     public static fromUserTrustLevel(
         userTrustLevel: UserTrustLevel,
@@ -648,14 +654,8 @@ export class DeviceTrustLevel {
             userTrustLevel.isTofu(),
             localVerified,
             trustCrossSignedDevices,
+            true,
         );
-    }
-
-    /**
-     * @returns true if this device is verified via any means
-     */
-    public isVerified(): boolean {
-        return Boolean(this.isLocallyVerified() || (this.trustCrossSignedDevices && this.isCrossSigningVerified()));
     }
 
     /**

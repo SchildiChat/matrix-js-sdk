@@ -38,6 +38,7 @@ export * from "./models/poll";
 export * from "./models/room-member";
 export * from "./models/room-state";
 export * from "./models/user";
+export * from "./models/device";
 export * from "./scheduler";
 export * from "./filter";
 export * from "./timeline-window";
@@ -63,6 +64,7 @@ export type { MatrixCall } from "./webrtc/call";
 export { GroupCallEvent, GroupCallIntent, GroupCallState, GroupCallType } from "./webrtc/groupCall";
 export type { GroupCall } from "./webrtc/groupCall";
 export type { CryptoApi } from "./crypto-api";
+export { DeviceVerificationStatus } from "./crypto-api";
 export { CryptoEvent } from "./crypto";
 
 let cryptoStoreFactory = (): CryptoStore => new MemoryCryptoStore();
