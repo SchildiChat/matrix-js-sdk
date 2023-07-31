@@ -18,7 +18,7 @@ import { IMinimalEvent } from "./sync-accumulator";
 import { EventType } from "./@types/event";
 import { isSupportedReceiptType, MapWithDefault, recursiveMapToObject } from "./utils";
 import { IContent } from "./models/event";
-import { MAIN_ROOM_TIMELINE, ReceiptContent, ReceiptType } from "./@types/read_receipts";
+import { ReceiptContent, ReceiptType } from "./@types/read_receipts";
 
 interface AccumulatedReceipt {
     data: IMinimalEvent;
@@ -118,7 +118,27 @@ export class ReceiptAccumulator {
                             eventId,
                         };
 
-                        if (!data.thread_id || data.thread_id === MAIN_ROOM_TIMELINE) {
+                        // In a world that supports threads, read receipts normally have
+                        // a `thread_id` which is either the thread they belong in or
+                        // `MAIN_ROOM_TIMELINE`, so we normally use `setThreaded(...)`
+                        // here. The `MAIN_ROOM_TIMELINE` is just treated as another
+                        // thread.
+                        //
+                        // We still encounter read receipts that are "unthreaded"
+                        // (missing the `thread_id` property). These come from clients
+                        // that don't support threads, and from threaded clients that
+                        // are doing a "Mark room as read" operation. Unthreaded
+                        // receipts mark everything "before" them as read, in all
+                        // threads, where "before" means in Sync Order i.e. the order
+                        // the events were received from the homeserver in a sync.
+                        // [Note: we have some bugs where we use timestamp order instead
+                        // of Sync Order, because we don't correctly remember the Sync
+                        // Order. See #3325.]
+                        //
+                        // Calling the wrong method will cause incorrect behavior like
+                        // messages re-appearing as "new" when you already read them
+                        // previously.
+                        if (!data.thread_id) {
                             this.setUnthreaded(userId, receipt);
                         } else {
                             this.setThreaded(data.thread_id, userId, receipt);

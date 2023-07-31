@@ -20,12 +20,13 @@ import { logger } from "./logger";
 import { MatrixClient } from "./client";
 import { defer, IDeferred } from "./utils";
 import { MatrixError } from "./http-api";
+import { UIAResponse } from "./@types/uia";
 
 const EMAIL_STAGE_TYPE = "m.login.email.identity";
 const MSISDN_STAGE_TYPE = "m.login.msisdn";
 
 export interface UIAFlow {
-    stages: AuthType[];
+    stages: Array<AuthType | string>;
 }
 
 export interface IInputs {
@@ -118,6 +119,16 @@ export class NoAuthFlowFoundError extends Error {
     }
 }
 
+/**
+ * The type of an application callback to perform the user-interactive bit of UIA.
+ *
+ * It is called with a single parameter, `makeRequest`, which is a function which takes the UIA parameters and
+ * makes the HTTP request.
+ *
+ * The generic parameter `T` is the type of the response of the endpoint, once it is eventually successful.
+ */
+export type UIAuthCallback<T> = (makeRequest: (authData: IAuthDict) => Promise<UIAResponse<T>>) => Promise<T>;
+
 interface IOpts {
     /**
      * A matrix client to use for the auth process
@@ -146,6 +157,14 @@ interface IOpts {
     emailSid?: string;
 
     /**
+     * If specified, will prefer flows which entirely consist of listed stages.
+     * These should normally be of type AuthTypes but can be string when supporting custom auth stages.
+     *
+     * This can be used to avoid needing the fallback mechanism.
+     */
+    supportedStages?: Array<AuthType | string>;
+
+    /**
      * Called with the new auth dict to submit the request.
      * Also passes a second deprecated arg which is a flag set to true if this request is a background request.
      * The busyChanged callback should be used instead of the background flag.
@@ -165,7 +184,7 @@ interface IOpts {
      *     m.login.email.identity:
      *         * emailSid: string, the sid of the active email auth session
      */
-    stateUpdated(nextStage: AuthType, status: IStageStatus): void;
+    stateUpdated(nextStage: AuthType | string, status: IStageStatus): void;
 
     /**
      * A function that takes the email address (string), clientSecret (string), attempt number (int) and
@@ -205,6 +224,7 @@ export class InteractiveAuth {
     private readonly busyChangedCallback?: IOpts["busyChanged"];
     private readonly stateUpdatedCallback: IOpts["stateUpdated"];
     private readonly requestEmailTokenCallback: IOpts["requestEmailToken"];
+    private readonly supportedStages?: Set<string>;
 
     private data: IAuthData;
     private emailSid?: string;
@@ -232,6 +252,7 @@ export class InteractiveAuth {
         if (opts.sessionId) this.data.session = opts.sessionId;
         this.clientSecret = opts.clientSecret || this.matrixClient.generateClientSecret();
         this.emailSid = opts.emailSid;
+        if (opts.supportedStages !== undefined) this.supportedStages = new Set(opts.supportedStages);
     }
 
     /**
@@ -560,7 +581,7 @@ export class InteractiveAuth {
      * @returns login type
      * @throws {@link NoAuthFlowFoundError} If no suitable authentication flow can be found
      */
-    private chooseStage(): AuthType | undefined {
+    private chooseStage(): AuthType | string | undefined {
         if (this.chosenFlow === null) {
             this.chosenFlow = this.chooseFlow();
         }
@@ -568,6 +589,17 @@ export class InteractiveAuth {
         const nextStage = this.firstUncompletedStage(this.chosenFlow);
         logger.log("Next stage: %s", nextStage);
         return nextStage;
+    }
+
+    // Returns a low number for flows we consider best. Counts increase for longer flows and even more so
+    // for flows which contain stages not listed in `supportedStages`.
+    private scoreFlow(flow: UIAFlow): number {
+        let score = flow.stages.length;
+        if (this.supportedStages !== undefined) {
+            // Add 10 points to the score for each unsupported stage in the flow.
+            score += flow.stages.filter((stage) => !this.supportedStages!.has(stage)).length * 10;
+        }
+        return score;
     }
 
     /**
@@ -591,6 +623,10 @@ export class InteractiveAuth {
         // we've been given an email or we've already done an email part
         const haveEmail = Boolean(this.inputs.emailAddress) || Boolean(this.emailSid);
         const haveMsisdn = Boolean(this.inputs.phoneCountry) && Boolean(this.inputs.phoneNumber);
+
+        // Flows are not represented in a significant order, so we can choose any we support best
+        // Sort flows based on how many unsupported stages they contain ascending
+        flows.sort((a, b) => this.scoreFlow(a) - this.scoreFlow(b));
 
         for (const flow of flows) {
             let flowHasEmail = false;
@@ -622,7 +658,7 @@ export class InteractiveAuth {
      * @internal
      * @returns login type
      */
-    private firstUncompletedStage(flow: UIAFlow): AuthType | undefined {
+    private firstUncompletedStage(flow: UIAFlow): AuthType | string | undefined {
         const completed = this.data.completed || [];
         return flow.stages.find((stageType) => !completed.includes(stageType));
     }

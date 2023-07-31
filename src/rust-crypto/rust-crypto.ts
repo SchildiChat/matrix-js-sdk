@@ -30,10 +30,13 @@ import { RoomEncryptor } from "./RoomEncryptor";
 import { OutgoingRequest, OutgoingRequestProcessor } from "./OutgoingRequestProcessor";
 import { KeyClaimManager } from "./KeyClaimManager";
 import { MapWithDefault } from "../utils";
-import { DeviceVerificationStatus } from "../crypto-api";
+import { BootstrapCrossSigningOpts, DeviceVerificationStatus } from "../crypto-api";
 import { deviceKeysToDeviceMap, rustDeviceToJsDevice } from "./device-converter";
 import { IDownloadKeyResult, IQueryKeysRequest } from "../client";
 import { Device, DeviceMap } from "../models/device";
+import { ServerSideSecretStorage } from "../secret-storage";
+import { CrossSigningKey } from "../crypto/api";
+import { CrossSigningIdentity } from "./CrossSigningIdentity";
 
 /**
  * An implementation of {@link CryptoBackend} using the Rust matrix-sdk-crypto.
@@ -54,16 +57,32 @@ export class RustCrypto implements CryptoBackend {
     private eventDecryptor: EventDecryptor;
     private keyClaimManager: KeyClaimManager;
     private outgoingRequestProcessor: OutgoingRequestProcessor;
+    private crossSigningIdentity: CrossSigningIdentity;
 
     public constructor(
+        /** The `OlmMachine` from the underlying rust crypto sdk. */
         private readonly olmMachine: RustSdkCryptoJs.OlmMachine,
+
+        /**
+         * Low-level HTTP interface: used to make outgoing requests required by the rust SDK.
+         *
+         * We expect it to set the access token, etc.
+         */
         private readonly http: MatrixHttpApi<IHttpOpts & { onlyData: true }>,
+
+        /** The local user's User ID. */
         _userId: string,
+
+        /** The local user's Device ID. */
         _deviceId: string,
+
+        /** Interface to server-side secret storage */
+        _secretStorage: ServerSideSecretStorage,
     ) {
         this.outgoingRequestProcessor = new OutgoingRequestProcessor(olmMachine, http);
         this.keyClaimManager = new KeyClaimManager(olmMachine, this.outgoingRequestProcessor);
         this.eventDecryptor = new EventDecryptor(olmMachine);
+        this.crossSigningIdentity = new CrossSigningIdentity(olmMachine, this.outgoingRequestProcessor);
     }
 
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -302,6 +321,35 @@ export class RustCrypto implements CryptoBackend {
         });
     }
 
+    /**
+     * Implementation of {@link CryptoApi#isCrossSigningReady}
+     */
+    public async isCrossSigningReady(): Promise<boolean> {
+        return false;
+    }
+
+    /**
+     * Implementation of {@link CryptoApi#getCrossSigningKeyId}
+     */
+    public async getCrossSigningKeyId(type: CrossSigningKey = CrossSigningKey.Master): Promise<string | null> {
+        // TODO
+        return null;
+    }
+
+    /**
+     * Implementation of {@link CryptoApi#boostrapCrossSigning}
+     */
+    public async bootstrapCrossSigning(opts: BootstrapCrossSigningOpts): Promise<void> {
+        await this.crossSigningIdentity.bootstrapCrossSigning(opts);
+    }
+
+    /**
+     * Implementation of {@link CryptoApi#isSecretStorageReady}
+     */
+    public async isSecretStorageReady(): Promise<boolean> {
+        return false;
+    }
+
     ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     //
     // SyncCryptoCallbacks implementation
@@ -319,7 +367,7 @@ export class RustCrypto implements CryptoBackend {
     private async receiveSyncChanges({
         events,
         oneTimeKeysCounts = new Map<string, number>(),
-        unusedFallbackKeys = new Set<string>(),
+        unusedFallbackKeys,
         devices = new RustSdkCryptoJs.DeviceLists(),
     }: {
         events?: IToDeviceEvent[];
