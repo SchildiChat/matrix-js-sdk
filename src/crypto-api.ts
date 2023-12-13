@@ -83,6 +83,15 @@ export interface CryptoApi {
     exportRoomKeys(): Promise<IMegolmSessionData[]>;
 
     /**
+     * Import a list of room keys previously exported by exportRoomKeys
+     *
+     * @param keys - a list of session export objects
+     * @param opts - options object
+     * @returns a promise which resolves once the keys have been imported
+     */
+    importRoomKeys(keys: IMegolmSessionData[], opts?: ImportRoomKeysOpts): Promise<void>;
+
+    /**
      * Get the device information for the given list of users.
      *
      * For any users whose device lists are cached (due to sharing an encrypted room with the user), the
@@ -185,6 +194,13 @@ export interface CryptoApi {
      * @returns True if secret storage is ready to be used on this device
      */
     isSecretStorageReady(): Promise<boolean>;
+
+    /**
+     * Get the status of our cross-signing keys.
+     *
+     * @returns The current status of cross-signing keys: whether we have public and private keys cached locally, and whether the private keys are in secret storage.
+     */
+    getCrossSigningStatus(): Promise<CrossSigningStatus>;
 }
 
 /**
@@ -262,4 +278,49 @@ export class DeviceVerificationStatus {
     }
 }
 
+/**
+ * Room key import progress report.
+ * Used when calling {@link CryptoApi#importRoomKeys} as the parameter of
+ * the progressCallback. Used to display feedback.
+ */
+export interface ImportRoomKeyProgressData {
+    stage: string; // TODO: Enum
+    successes: number;
+    failures: number;
+    total: number;
+}
+
+/**
+ * Options object for {@link CryptoApi#importRoomKeys}.
+ */
+export interface ImportRoomKeysOpts {
+    /** Reports ongoing progress of the import process. Can be used for feedback. */
+    progressCallback?: (stage: ImportRoomKeyProgressData) => void;
+    // TODO, the rust SDK will always such imported keys as untrusted
+    untrusted?: boolean;
+    source?: String; // TODO: Enum (backup, file, ??)
+}
+
 export * from "./crypto-api/verification";
+
+/**
+ * The result of a call to {@link CryptoApi.getCrossSigningStatus}.
+ */
+export interface CrossSigningStatus {
+    /**
+     * True if the public master, self signing and user signing keys are available on this device.
+     */
+    publicKeysOnDevice: boolean;
+    /**
+     * True if the private keys are stored in the secret storage.
+     */
+    privateKeysInSecretStorage: boolean;
+    /**
+     * True if the private keys are stored locally.
+     */
+    privateKeysCachedLocally: {
+        masterKey: boolean;
+        selfSigningKey: boolean;
+        userSigningKey: boolean;
+    };
+}
