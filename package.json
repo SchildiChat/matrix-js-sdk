@@ -1,6 +1,6 @@
 {
     "name": "matrix-js-sdk",
-    "version": "26.1.0",
+    "version": "26.2.0",
     "description": "Matrix Client-Server SDK for Javascript",
     "engines": {
         "node": ">=16.0.0"
@@ -55,7 +55,7 @@
     ],
     "dependencies": {
         "@babel/runtime": "^7.12.5",
-        "@matrix-org/matrix-sdk-crypto-js": "^0.1.0-alpha.10",
+        "@matrix-org/matrix-sdk-crypto-js": "^0.1.0-alpha.11",
         "another-json": "^0.2.0",
         "bs58": "^5.0.0",
         "content-type": "^1.0.4",
@@ -107,7 +107,7 @@
         "eslint-import-resolver-typescript": "^3.5.1",
         "eslint-plugin-import": "^2.26.0",
         "eslint-plugin-jest": "^27.1.6",
-        "eslint-plugin-jsdoc": "^45.0.0",
+        "eslint-plugin-jsdoc": "^46.0.0",
         "eslint-plugin-matrix-org": "^1.0.0",
         "eslint-plugin-tsdoc": "^0.2.17",
         "eslint-plugin-unicorn": "^47.0.0",
