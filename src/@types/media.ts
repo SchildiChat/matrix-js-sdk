@@ -180,6 +180,9 @@ export interface FileContent extends BaseContent {
      * One of: [m.file].
      */
     msgtype: MsgType.File;
+
+    format?: string;
+    formatted_body?: string;
 }
 
 /**
@@ -202,6 +205,9 @@ export interface ImageContent extends BaseContent {
      * One of: [m.image].
      */
     msgtype: MsgType.Image;
+
+    format?: string;
+    formatted_body?: string;
 }
 
 /**
@@ -223,6 +229,9 @@ export interface AudioContent extends BaseContent {
      * One of: [m.audio].
      */
     msgtype: MsgType.Audio;
+
+    format?: string;
+    formatted_body?: string;
 }
 
 /**
@@ -244,6 +253,9 @@ export interface VideoContent extends BaseContent {
      * One of: [m.video].
      */
     msgtype: MsgType.Video;
+
+    format?: string;
+    formatted_body?: string;
 }
 
 /**
